@@ -133,7 +133,13 @@ m4.metric("Corner-limited segments", f"{int((course.vcap < 0.9 * cs.max_descent_
 # --------------------------------------------------------------------- inputs
 st.subheader("2. Power and weather")
 i1, i2 = st.columns([1, 2])
-np_target = i1.number_input("Target normalised power (W)", 50.0, 600.0, 250.0, 1.0)
+np_race = i1.number_input("Target normalised power (W)", 50.0, 600.0, 250.0, 1.0)
+race_vi = i1.number_input(
+    "Expected race variability index (VI)", 1.00, 1.15, 1.02, 0.01,
+    help="Real races are not dead-even: you coast, brake and surge, so average power is NP / VI. "
+         "Almere (flat, 178 km) was 1.024. Set 1.00 for a perfectly constant-power ride.")
+# The simulator rides at constant power, so hold the average power a variable ride with this NP would have
+np_target = np_race / race_vi
 mode = i2.radio("Weather", ["Open-Meteo (forecast / archive)", "Manual wind", "None (still air)"], horizontal=True)
 
 env = Environment()
@@ -176,8 +182,8 @@ r1, r2, r3, r4, r5 = st.columns(5)
 r1.metric("Time", fmt_time(even.total_time_s))
 r2.metric("Average speed", f"{even.avg_speed_kmh:.1f} km/h")
 r3.metric("Average power", f"{even.avg_power:.0f} W")
-r4.metric("Normalised power", f"{even.np_w:.0f} W")
-r5.metric("VI", f"{even.vi:.3f}")
+r4.metric("Normalised power (target)", f"{np_race:.0f} W")
+r5.metric("Assumed VI", f"{race_vi:.2f}")
 
 st.plotly_chart(viz_race.fig_elevation(course, even.headwind if env.weather is not None else None),
                 use_container_width=True)
