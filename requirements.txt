@@ -3,3 +3,9 @@ numpy
 matplotlib
 scipy
 fitparse
+plotly
+streamlit
+gpxpy
+numba
+requests
+pytest
