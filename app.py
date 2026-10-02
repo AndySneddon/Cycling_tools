@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import streamlit as st
 
+from cycling_tools.branding import apply_branding
+
 from cycling_tools.profile import PROFILE_PATH, RiderProfile
 
 try:
@@ -12,6 +14,7 @@ except ImportError:  # gearing module not available yet
     CASSETTES = {"11-30 (12sp)": [11, 12, 13, 14, 15, 16, 17, 19, 21, 24, 27, 30]}
 
 st.set_page_config(page_title="Cycling Tools", page_icon="🚴", layout="wide")
+apply_branding(show_header_logo=True)
 st.title("🚴 Cycling Tools")
 st.write(
     "Learn about yourself on the bike, then plan races with it. Work left to right:\n\n"

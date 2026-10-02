@@ -10,12 +10,15 @@ sys.path.insert(0, str(ROOT))
 
 import streamlit as st
 
+from cycling_tools.branding import apply_branding
+
 from cycling_tools import gearing as g
 from cycling_tools import viz_gearing as vz
 from cycling_tools.fit_io import load_fit
 from cycling_tools.profile import RiderProfile
 
 st.set_page_config(page_title="Gearing", layout="wide")
+apply_branding()
 st.title("Best chainring analyser")
 st.caption("Assumes you keep your observed speed and cadence preference when swapping chainrings. "
            "The nearest real sprocket is used, so 'cadence error' shows the cost of gear-step quantisation.")

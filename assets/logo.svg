@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 380 100" width="380" height="100" role="img" aria-label="Sneddon in Sport">
+  <rect width="380" height="100" rx="16" fill="#0B2A4A"/>
+  <!-- emblem: swim / bike / run -->
+  <g transform="translate(8,4)">
+    <circle cx="48" cy="46" r="40" fill="#123a63"/>
+    <!-- bike wheel -->
+    <circle cx="48" cy="44" r="25" fill="none" stroke="#FFFFFF" stroke-width="4"/>
+    <g stroke="#7FD1FF" stroke-width="1.6" stroke-linecap="round">
+      <line x1="48" y1="19" x2="48" y2="69"/>
+      <line x1="23" y1="44" x2="73" y2="44"/>
+      <line x1="30.3" y1="26.3" x2="65.7" y2="61.7"/>
+      <line x1="65.7" y1="26.3" x2="30.3" y2="61.7"/>
+    </g>
+    <circle cx="48" cy="44" r="4.5" fill="#FF6B35"/>
+    <!-- swim wave -->
+    <path d="M14 76 q8 -9 16 0 t16 0 t16 0 t16 0" fill="none" stroke="#4FC3F7" stroke-width="4.5" stroke-linecap="round"/>
+    <!-- run chevrons -->
+    <path d="M62 10 l9 9 l-9 9 M72 10 l9 9 l-9 9" fill="none" stroke="#FF6B35" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <!-- wordmark -->
+  <text x="118" y="52" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="34" font-weight="800" letter-spacing="3" fill="#FFFFFF">SNEDDON</text>
+  <text x="120" y="78" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="19" font-weight="700" letter-spacing="9" fill="#FF6B35">IN SPORT</text>
+  <rect x="120" y="60" width="238" height="2.5" rx="1.25" fill="#4FC3F7"/>
+</svg>

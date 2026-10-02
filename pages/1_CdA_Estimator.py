@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from cycling_tools.branding import apply_branding
+
 from cycling_tools import viz_cda as vz
 from cycling_tools.cda import (
     REASON_LABELS, CdAConfig, MaskConfig, analyse_ride, best_wind_scale, fit_cda_ve, try_fetch_weather,
@@ -23,6 +25,7 @@ from cycling_tools.profile import RiderProfile
 from cycling_tools.weather import constant_weather
 
 st.set_page_config(page_title="CdA Estimator", layout="wide")
+apply_branding()
 st.title("CdA estimator")
 st.caption("Full dynamic power balance (aero, rolling, climbing, acceleration) with weather-corrected wind and air "
            "density. Coasting, braking, cornering and stops are masked, then CdA is fitted robustly (Huber).")
