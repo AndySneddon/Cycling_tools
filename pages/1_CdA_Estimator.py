@@ -21,6 +21,7 @@ from cycling_tools.cda import (
     wind_scale_scan,
 )
 from cycling_tools.fit_io import load_fit
+from cycling_tools.physics import normalised_power
 from cycling_tools.profile import RiderProfile
 from cycling_tools.weather import constant_weather
 
@@ -172,6 +173,23 @@ c2.metric("95% CI", f"{lo:.3f} - {hi:.3f}" if np.isfinite(lo) else "n/a")
 c3.metric("Crr used", f"{res.crr:.4f}")
 c4.metric("Valid data", f"{res.valid_pct:.0f}%", f"{res.n_valid} s")
 c5.metric("Air density", f"{res.meta['rho_mean']:.3f} kg/m³")
+
+# Power summary for the selected laps (all samples, including coasting), for use in the Race Planner
+sel = res.series[res.series["selected"]]
+sel_power = sel["power"].dropna().to_numpy(dtype=float)
+if sel_power.size >= 30:
+    avg_p = float(sel_power.mean())
+    np_p = normalised_power(sel_power)
+    vi_p = np_p / avg_p if avg_p > 0 else float("nan")
+    secs = int(sel_power.size)
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric("Normalised power", f"{np_p:.0f} W", help="30 s rolling 4th-power mean over the selected laps")
+    p2.metric("Average power", f"{avg_p:.0f} W", help="Includes coasting (zeros), as in a race")
+    p3.metric("Variability index", f"{vi_p:.3f}", help="NP / average power. Enter this as the race VI in the Race Planner")
+    p4.metric("Duration", f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}")
+    dist_km = float(sel["dist_km"].iloc[-1] - sel["dist_km"].iloc[0]) if "dist_km" in sel else float("nan")
+    p5.metric("Average speed", f"{dist_km / (secs / 3600):.1f} km/h" if np.isfinite(dist_km) and secs else "n/a")
+    st.caption("Use these in the Race Planner: set the target NP and expected VI to the values above.")
 st.caption(f"Wind: {res.meta['wind_source']} (scale {res.meta['wind_scale_used']:.2f}); density: {res.meta['rho_source']}; "
            f"residual RMS {res.resid_rms_w:.0f} W. The CI reflects sampling noise only, not systematic error "
            "(wind, mass, Crr, power-meter calibration).")
