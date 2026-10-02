@@ -48,13 +48,23 @@ def series_figure(res: CdAResult, x_axis: str = "time", show_masks: bool = True)
     fig.add_hline(y=res.cda, row=4, col=1, line=dict(color="black", dash="dash", width=1),
                   annotation_text=f"overall {res.cda:.3f}")
     if show_masks:
+        # One batched shapes list (add_vrect per run is ~100x slower with thousands of runs)
+        shapes = []
         taken = np.zeros(len(s), bool)
         for k in REASONS:
             mk = s["mask_" + k].to_numpy() & ~taken
             taken |= mk
+            merged: list[list[int]] = []
             for a, b in _runs(mk):
-                fig.add_vrect(x0=x[a], x1=x[min(b + 1, len(x) - 1)], fillcolor=REASON_COLOURS[k], opacity=0.22,
-                              line_width=0, layer="below")
+                if merged and a - merged[-1][1] <= 2:  # bridge 1-sample gaps
+                    merged[-1][1] = b
+                else:
+                    merged.append([a, b])
+            for a, b in merged:
+                shapes.append(dict(type="rect", xref="x", yref="paper", x0=x[a], x1=x[min(b + 1, len(x) - 1)],
+                                   y0=0, y1=1, fillcolor=REASON_COLOURS[k], opacity=0.22, line_width=0,
+                                   layer="below"))
+        fig.update_layout(shapes=list(fig.layout.shapes) + shapes)
         for k in REASONS:  # legend proxies
             if s["mask_" + k].any():
                 fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name=REASON_LABELS[k],
@@ -65,6 +75,16 @@ def series_figure(res: CdAResult, x_axis: str = "time", show_masks: bool = True)
     return fig
 
 
+def _fit_zoom(lat: pd.Series, lon: pd.Series, width_px: int = 480, height_px: int = 520) -> float:
+    """Web-mercator zoom that fits the route in the viewport (set explicitly: auto-fit fails in hidden tabs)."""
+    lat_span = max(float(lat.max() - lat.min()), 1e-4)
+    lon_span = max(float(lon.max() - lon.min()), 1e-4)
+    mid = np.radians((float(lat.max()) + float(lat.min())) / 2)
+    z_lon = np.log2(360.0 * width_px / (256.0 * lon_span))
+    z_lat = np.log2(180.0 * height_px / (256.0 * lat_span * (1.0 / max(np.cos(mid), 0.1))))
+    return float(np.clip(min(z_lon, z_lat) - 0.3, 1, 17))
+
+
 def map_figure(res: CdAResult) -> go.Figure:
     s = _selected(res).dropna(subset=["lat", "lon"])
     s = s.iloc[::3]
@@ -73,7 +93,10 @@ def map_figure(res: CdAResult) -> go.Figure:
     vals = s["rolling_cda"]
     lo, hi = (np.nanpercentile(vals, [5, 95]) if vals.notna().any() else (0.2, 0.3))
     fig = px.scatter_map(s, lat="lat", lon="lon", color="rolling_cda", color_continuous_scale="Turbo",
-                         range_color=(lo, hi), zoom=11, height=520,
+                         range_color=(lo, hi), height=520,
+                         center=dict(lat=float((s["lat"].min() + s["lat"].max()) / 2),
+                                     lon=float((s["lon"].min() + s["lon"].max()) / 2)),
+                         zoom=_fit_zoom(s["lat"], s["lon"]),
                          hover_data={"speed": ":.1f", "power": ":.0f", "lat": False, "lon": False})
     fig.update_layout(map_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0),
                       coloraxis_colorbar=dict(title="CdA"))

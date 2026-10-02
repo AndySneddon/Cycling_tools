@@ -231,3 +231,51 @@ def test_streamlit_page_smoke():
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert at.metric and at.metric[0].label.startswith("CdA")
+
+
+def test_series_figure_with_many_mask_runs_is_fast():
+    """Regression: shading thousands of excluded runs with add_vrect once took minutes."""
+    import time
+
+    import numpy as np
+    import pandas as pd
+
+    from cycling_tools import viz_cda
+    from cycling_tools.cda import REASONS
+
+    n = 6000
+    rng = np.random.default_rng(0)
+    cols = {"t_s": np.arange(n, dtype=float), "dist_km": np.arange(n) / 1000.0, "power": 250.0,
+            "speed": 11.0, "headwind": 0.0, "rolling_cda": 0.22, "selected": True}
+    for k in REASONS:
+        cols["mask_" + k] = rng.random(n) < 0.3  # ~900 alternating runs per reason
+    series = pd.DataFrame(cols)
+
+    class Res:
+        pass
+
+    res = Res()
+    res.series, res.cda = series, 0.22
+    t0 = time.time()
+    fig = viz_cda.series_figure(res, "time")
+    assert time.time() - t0 < 5
+    assert len(fig.layout.shapes) > 100
+
+
+def test_map_figure_centre_is_on_route():
+    import pandas as pd
+
+    from cycling_tools import viz_cda
+
+    n = 200
+    series = pd.DataFrame({"lat": 53.2 + 0.0003 * pd.Series(range(n)), "lon": -2.3 + 0.0004 * pd.Series(range(n)),
+                           "rolling_cda": 0.21, "speed": 10.0, "power": 200.0, "selected": True})
+
+    class Res:
+        pass
+
+    res = Res()
+    res.series = series
+    fig = viz_cda.map_figure(res)
+    assert abs(fig.layout.map.center.lat - 53.23) < 0.05
+    assert 5 < fig.layout.map.zoom < 17

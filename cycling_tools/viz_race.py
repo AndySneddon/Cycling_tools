@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from .course import Course
+from .viz_cda import _fit_zoom
 from .simulate import SimResult, fmt_time, gear_usage
 
 GRADE_BINS = [
@@ -76,7 +77,7 @@ def fig_map(course: Course, result: SimResult | None = None, colour_by: str = "s
     else:
         z, label = course.grade[sl] * 100.0, "Gradient (%)"
     df = pd.DataFrame({"lat": lat, "lon": lon, "z": z, "km": course.seg_mid_m[sl] / 1000.0})
-    zoom = 11 if course.length_m < 60e3 else 10
+    zoom = _fit_zoom(df["lat"], df["lon"], height_px=450)
     cscale = "RdBu_r" if colour_by == "grade" or result is None else "Viridis"
     fig = px.scatter_map(df, lat="lat", lon="lon", color="z", color_continuous_scale=cscale,
                          hover_data={"km": ":.1f", "z": ":.1f", "lat": False, "lon": False},
