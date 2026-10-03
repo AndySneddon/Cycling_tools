@@ -1,0 +1,23 @@
+[client]
+toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#F25C2A"
+font = "sans serif"
+baseRadius = "large"
+chartCategoricalColors = ["#1E88E5", "#F25C2A", "#26A69A", "#8E6BBF", "#E0B400", "#5C7A99", "#D81B60", "#6D4C41"]
+chartSequentialColors = ["#E3F2FD", "#90CAF9", "#42A5F5", "#1E88E5", "#1565C0", "#0B2A4A"]
+
+[theme.light]
+backgroundColor = "#F5F8FC"
+secondaryBackgroundColor = "#E6EDF6"
+textColor = "#0B2A4A"
+primaryColor = "#E4501C"
+linkColor = "#1565C0"
+
+[theme.dark]
+backgroundColor = "#0B1A2C"
+secondaryBackgroundColor = "#12273F"
+textColor = "#E8F0FA"
+primaryColor = "#FF6B35"
+linkColor = "#4FC3F7"

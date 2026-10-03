@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from cycling_tools.branding import apply_branding
+from cycling_tools.branding import PAGE_ICON, apply_branding, page_header
 
 from cycling_tools import viz_cda as vz
 from cycling_tools.cda import (
@@ -24,11 +24,12 @@ from cycling_tools.physics import normalised_power
 from cycling_tools.profile import RiderProfile
 from cycling_tools.weather import constant_weather
 
-st.set_page_config(page_title="CdA Estimator", layout="wide")
+st.set_page_config(page_title="CdA Estimator", page_icon=PAGE_ICON, layout="wide")
 apply_branding()
-st.title("CdA estimator")
-st.caption("Full dynamic power balance (aero, rolling, climbing, acceleration) with weather-corrected wind and air "
-           "density. Coasting, braking, cornering and stops are masked, then CdA is fitted robustly (Huber).")
+page_header("CdA Estimator",
+            "Full dynamic power balance (aero, rolling, climbing, acceleration) with weather-corrected wind and air "
+            "density. Coasting, braking, cornering and stops are masked, then CdA is fitted robustly.",
+            eyebrow="Tool 1 · Aerodynamics")
 
 FIT_DIR = ROOT / "Fit_files"
 profile = RiderProfile.load()
@@ -183,7 +184,7 @@ sr = res.sys_range or {}
 conf = res.confidence or {"level": "n/a", "items": []}
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("CdA (m²)", f"{res.cda:.3f}")
-c2.metric("95% CI (sampling)", f"{lo:.3f} - {hi:.3f}" if np.isfinite(lo) else "n/a",
+c2.metric("95% CI (sampling)", f"{lo:.3f}–{hi:.3f}" if np.isfinite(lo) else "n/a",
           help=f"Moving-block bootstrap, {res.meta.get('ci_block_s', '?')} s blocks. Sampling noise only.")
 c3.metric("Systematic range", f"±{sr['half']:.3f}" if sr else "n/a",
           help=f"Crr ±{CRR_STEP:.3f}: ±{sr.get('crr_half', 0):.3f}; wind-scale optimum across thirds: "

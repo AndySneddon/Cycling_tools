@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from cycling_tools.branding import apply_branding
+from cycling_tools.branding import PAGE_ICON, apply_branding, page_header
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -31,10 +31,12 @@ try:
 except ImportError:  # pragma: no cover
     CASSETTES = {"Ultegra 11-30 (12sp)": [11, 12, 13, 14, 15, 16, 17, 19, 21, 24, 27, 30]}
 
-st.set_page_config(page_title="Race Planner", page_icon="🏁", layout="wide")
+st.set_page_config(page_title="Race Planner", page_icon=PAGE_ICON, layout="wide")
 apply_branding()
-st.title("🏁 Race Planner")
-st.caption("Predict a bike split from a GPX course, a power target and the weather; then optimise pacing.")
+page_header("Race Planner",
+            "Predict a bike split from a GPX course, a power target and the weather, choose the right chainring, "
+            "then optimise your pacing.",
+            eyebrow="Tool 3 · Race strategy")
 
 COURSES_DIR = ROOT / "courses"
 
