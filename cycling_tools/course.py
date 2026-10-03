@@ -26,6 +26,10 @@ class CourseSettings:
     max_brake_decel: float = 3.0    # m/s^2 comfortable braking, used for the backward feasibility pass
     min_corner_speed: float = 3.0   # m/s floor on corner caps (tight U-turns / roundabouts)
     max_descent_speed: float = 22.0  # m/s (~80 km/h) cap on descents
+    alt_spike_window: int = 9       # points; Hampel (rolling median) despike of the raw altitude (0 = off)
+    alt_spike_sigma: float = 3.0    # robust sigmas (1.4826 * MAD) beyond which an altitude sample is a spike
+    alt_spike_min_m: float = 1.5    # ...but never flag deviations smaller than this (baro resolution / noise)
+    alt_warmup_s: float = 45.0      # FIT rides: baro altitude is unreliable for this long after power-on; drop it
 
 
 @dataclass
@@ -90,10 +94,34 @@ def _smooth_distance(values: np.ndarray, step_m: float, window_m: float, passes:
     size = int(round(window_m / step_m))
     if size < 2:
         return values.copy()
+    # An even-length uniform window is not centred on a sample (each pass would shift the profile by half a step),
+    # so use odd windows only. For an even size n the passes alternate n-1 and n+1, which keeps the total
+    # smoothing (variance) within ~1 % of two passes of n.
+    sizes = [size] * passes if size % 2 else [size - 1 + 2 * (k % 2) for k in range(passes)]
     out = values
-    for _ in range(passes):
-        out = uniform_filter1d(out, size=size, mode="nearest")
+    for sz in sizes:
+        out = uniform_filter1d(out, size=max(sz, 1), mode="nearest")
     return out
+
+
+def despike_altitude(elev, window: int = 9, sigma: float = 3.0, min_dev_m: float = 1.5) -> np.ndarray:
+    """Hampel filter: replace samples further than ``max(sigma * 1.4826 * MAD, min_dev_m)`` from the rolling
+    median by that median. NaNs are ignored (and kept)."""
+    e = np.asarray(elev, dtype=float).copy()
+    ok = np.isfinite(e)
+    if window < 3 or ok.sum() < window:
+        return e
+    window += 1 - window % 2
+    x = e[ok]
+    half = window // 2
+    pad = np.pad(x, half, mode="edge")
+    win = np.lib.stride_tricks.sliding_window_view(pad, window)
+    med = np.median(win, axis=1)
+    mad = np.median(np.abs(win - med[:, None]), axis=1) * 1.4826
+    bad = np.abs(x - med) > np.maximum(sigma * mad, min_dev_m)
+    x[bad] = med[bad]
+    e[ok] = x
+    return e
 
 
 def build_course(
@@ -124,6 +152,7 @@ def build_course(
     lat, lon = lat[keep], lon[keep]
     if elev_arr is not None:
         elev_arr = elev_arr[keep]
+        elev_arr = despike_altitude(elev_arr, cfg.alt_spike_window, cfg.alt_spike_sigma, cfg.alt_spike_min_m)
     raw_d = np.concatenate([[0.0], np.cumsum(haversine_m(lat[:-1], lon[:-1], lat[1:], lon[1:]))])
     if raw_d[-1] < 200:
         raise ValueError("Course is shorter than 200 m.")
@@ -161,14 +190,15 @@ def build_course(
 
 
 def _curvature(heading_deg: np.ndarray, ds: np.ndarray, step_m: float, cfg: CourseSettings) -> np.ndarray:
-    """|d heading / d s| (rad/m) measured over ``curvature_window_m``."""
+    """|d heading / d s| (rad/m) measured over an arc-length window of ``curvature_window_m`` centred on each
+    segment (heading is interpolated at s -/+ window/2, so the window is the same length for any step size)."""
     h = np.unwrap(np.radians(heading_deg))
-    k = max(1, int(round(cfg.curvature_window_m / step_m / 2)))
-    n = len(h)
-    i0 = np.clip(np.arange(n) - k, 0, n - 1)
-    i1 = np.clip(np.arange(n) + k, 0, n - 1)
-    dist = np.maximum((i1 - i0) * step_m, step_m)
-    return np.abs(h[i1] - h[i0]) / dist
+    s = np.cumsum(ds) - 0.5 * ds
+    half = 0.5 * cfg.curvature_window_m
+    s0 = np.clip(s - half, s[0], s[-1])
+    s1 = np.clip(s + half, s[0], s[-1])
+    dist = np.maximum(s1 - s0, step_m)
+    return np.abs(np.interp(s1, s, h) - np.interp(s0, s, h)) / dist
 
 
 def corner_speed_caps(curvature: np.ndarray, ds: np.ndarray, grade: np.ndarray, cfg: CourseSettings) -> np.ndarray:
@@ -258,8 +288,15 @@ def course_from_ride(ride, lap: int | None = None, *, settings: CourseSettings |
     df = df.dropna(subset=["lat", "lon"])
     if len(df) < 10:
         raise ValueError("Not enough GPS points in that ride/lap.")
+    cfg = settings or CourseSettings()
+    alt = df["alt"].to_numpy(dtype=float).copy() if "alt" in df else None
+    if alt is not None and cfg.alt_warmup_s > 0 and "timestamp" in df and df["timestamp"].iloc[0] == ride.df["timestamp"].iloc[0]:
+        # barometric altitude takes ~a minute to settle after the head unit starts (Almere: -17 m -> +4 m in
+        # 6 s, i.e. a fake 20 % wall); the first valid sample after the warm-up is held back to the start instead
+        t = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds().to_numpy()
+        alt[t < cfg.alt_warmup_s] = np.nan
     nm = name or (f"{ride.name} (lap {lap})" if lap is not None else ride.name)
     return build_course(
-        df["lat"].to_numpy(), df["lon"].to_numpy(), df["alt"].to_numpy() if "alt" in df else None,
-        name=nm, settings=settings, start_time=df["timestamp"].iloc[0],
+        df["lat"].to_numpy(), df["lon"].to_numpy(), alt,
+        name=nm, settings=cfg, start_time=df["timestamp"].iloc[0],
     )

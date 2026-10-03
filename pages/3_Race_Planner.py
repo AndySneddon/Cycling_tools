@@ -66,8 +66,9 @@ def cached_whatif(_course, _rider, _env, key, np_target):
 
 
 @st.cache_data(show_spinner="Optimising pacing...", max_entries=8)
-def cached_opt(_course, _rider, _env, key, np_target, block_m, bound_pct, smooth):
-    return optimise_pacing(_course, _rider, np_target, _env, block_m=block_m, bound_pct=bound_pct, smooth=smooth)
+def cached_opt(_course, _rider, _env, key, np_target, block_m, bound_pct, smooth, caps):
+    return optimise_pacing(_course, _rider, np_target, _env, block_m=block_m, bound_pct=bound_pct, smooth=smooth,
+                           power_caps=dict(caps))
 
 
 # --------------------------------------------------------------------- sidebar
@@ -134,15 +135,20 @@ m3.metric("Descent", f"{course.descent_m:.0f} m")
 m4.metric("Corner-limited segments", f"{int((course.vcap < 0.9 * cs.max_descent_speed).sum())}")
 
 # --------------------------------------------------------------------- inputs
+ckey = (course.name, course.n_seg, round(course.length_m), tuple(sorted(cs.__dict__.items())))
+rkey_even = (rider.mass_kg, rider.cda, rider.crr, rider.drivetrain_eff)
 st.subheader("2. Power and weather")
 i1, i2 = st.columns([1, 2])
 np_race = i1.number_input("Target normalised power (W)", 50.0, 600.0, 250.0, 1.0)
 race_vi = i1.number_input(
     "Expected race variability index (VI)", 1.00, 1.15, 1.02, 0.01,
-    help="Real races are not dead-even: you coast, brake and surge, so average power is NP / VI. "
-         "Almere (flat, 178 km) was 1.024. Set 1.00 for a perfectly constant-power ride.")
+    help="Real races are not dead-even: you coast, brake and surge, so average power is NP / VI. VI depends on the "
+         "course: roughly 1.02 for a flat, surgy course (Almere, 178 km, was 1.024), about 1.00 for a rolling TT "
+         "ridden to power, higher on hilly or technical routes. Set 1.00 for a perfectly constant-power ride. "
+         "The simulator rides at constant power, so it is given NP / VI (shown below as the simulated power).")
 # The simulator rides at constant power, so hold the average power a variable ride with this NP would have
 np_target = np_race / race_vi
+i1.caption(f"Your NP {np_race:.0f} W / VI {race_vi:.2f} = **{np_target:.0f} W** simulated constant power.")
 mode = i2.radio("Weather", ["Open-Meteo (forecast / archive)", "Manual wind", "None (still air)"], horizontal=True)
 
 env = Environment()
@@ -156,14 +162,21 @@ if mode.startswith("Open-Meteo"):
         tz = ZoneInfo(tzname)
         start_utc = datetime.combine(race_date, start_t, tzinfo=tz).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
         lat, lon = course.centre
-        wx = cached_weather(round(lat, 3), round(lon, 3), start_utc.isoformat(),
-                            (start_utc + timedelta(hours=6)).isoformat())
+        # weather window = start + predicted duration (still-air estimate) + margin, so long races do not run on
+        # a frozen last-hour wind
+        est_s = cached_even(course, rider, Environment(), ("still", ckey, rkey_even), np_target).total_time_s
+        end_utc = (pd.Timestamp(start_utc) + pd.Timedelta(seconds=1.3 * est_s + 3600.0)).ceil("h").to_pydatetime()
+        wx = cached_weather(round(lat, 3), round(lon, 3), start_utc.isoformat(), end_utc.isoformat())
         env = Environment(wx, pd.Timestamp(start_utc), rider.wind_scale)
-        env_key = ("om", round(lat, 3), round(lon, 3), start_utc.isoformat(), rider.wind_scale)
+        env_key = ("om", round(lat, 3), round(lon, 3), start_utc.isoformat(), rider.wind_scale, wx.source,
+                   str(wx.hourly.index[-1]))
         h = wx.at([start_utc])
         st.caption(f"{wx.source}: at start {h['temp_c'].iloc[0]:.1f} °C, wind {h['wind_ms'].iloc[0]:.1f} m/s "
                    f"from {h['wind_dir'].iloc[0]:.0f}° (×{rider.wind_scale:.2f} at rider height)")
-    except (WeatherError, Exception) as exc:  # noqa: BLE001
+    except WeatherError as exc:
+        st.warning(f"Weather unavailable ({exc}) Using still air for this prediction; switch to **Manual wind** to "
+                   "enter conditions yourself.")
+    except Exception as exc:  # noqa: BLE001
         st.warning(f"Weather unavailable ({exc}); using still air.")
 elif mode.startswith("Manual"):
     w1, w2, w3, w4 = st.columns(4)
@@ -174,19 +187,24 @@ elif mode.startswith("Manual"):
     env = Environment(constant_weather(temp, ws / 3.6, wd, pres), None, 1.0)
     env_key = ("manual", ws, wd, temp, pres)
 
-ckey = (course.name, course.n_seg, round(course.length_m), tuple(sorted(cs.__dict__.items())))
-rkey = (rider.mass_kg, rider.cda, rider.crr, rider.drivetrain_eff)
+rkey = rkey_even
 key = (ckey, rkey, env_key)
 
 # --------------------------------------------------------------------- results
 even = cached_even(course, rider, env, key, np_target)
+if env.time_dependent and env.weather.hourly.index[-1] < env.start_time + pd.Timedelta(seconds=even.total_time_s):
+    st.warning("The weather data ends before the predicted finish "
+               f"({env.weather.hourly.index[-1]:%d %b %H:%M} UTC): the last available wind is held for the rest of "
+               "the race (the forecast horizon is ~16 days).")
 st.subheader("3. Predicted split (even pacing)")
 r1, r2, r3, r4, r5 = st.columns(5)
 r1.metric("Time", fmt_time(even.total_time_s))
 r2.metric("Average speed", f"{even.avg_speed_kmh:.1f} km/h")
-r3.metric("Average power", f"{even.avg_power:.0f} W")
-r4.metric("Normalised power (target)", f"{np_race:.0f} W")
-r5.metric("Assumed VI", f"{race_vi:.2f}")
+r3.metric("Simulated average power (NP/VI)", f"{np_target:.0f} W",
+          help="The simulator pedals at this constant power. Ride average including coasting: "
+               f"{even.avg_power:.0f} W.")
+r4.metric("Your NP", f"{np_race:.0f} W")
+r5.metric("Your VI", f"{race_vi:.2f}", help="Course dependent: ~1.02 flat/surgy, ~1.00 for a rolling TT.")
 
 st.plotly_chart(viz_race.fig_elevation(course, even.headwind if env.weather is not None else None),
                 use_container_width=True)
@@ -201,16 +219,17 @@ st.dataframe(sp[["split", "split_time", "cum_time", "speed_kmh", "power_w", "ele
 # ------------------------------------------------------------- NP sensitivity
 st.subheader("4. How much does NP matter?")
 curve = cached_curve(course, rider, env, key, float(round(np_target * 0.75)), float(round(np_target * 1.25)))
-sel = st.slider("Try a different NP (W)", float(curve["np_w"].min()), float(curve["np_w"].max()), float(np_target), 1.0)
-alt = cached_even(course, rider, env, key, sel)
+curve = curve.assign(np_w=curve["np_w"] * race_vi, s_saved_per_5w=curve["s_saved_per_5w"] / race_vi)  # to your NP
+sel = st.slider("Try a different NP (W)", float(curve["np_w"].min()), float(curve["np_w"].max()), float(np_race), 1.0)
+alt = cached_even(course, rider, env, key, sel / race_vi)
 s1, s2, s3 = st.columns(3)
-s1.metric("Time at selected NP", fmt_time(alt.total_time_s), f"{alt.total_time_s - even.total_time_s:+.0f} s vs target")
+s1.metric("Time at selected NP", fmt_time(alt.total_time_s), f"{alt.total_time_s - even.total_time_s:+.0f} s vs target NP")
 s2.metric("Average speed", f"{alt.avg_speed_kmh:.1f} km/h")
-near = curve.iloc[(curve["np_w"] - np_target).abs().argmin()]
-s3.metric("Seconds per +5 W", f"{near['s_saved_per_5w']:.0f} s")
+near = curve.iloc[(curve["np_w"] - np_race).abs().argmin()]
+s3.metric("Seconds per +5 W of NP", f"{near['s_saved_per_5w']:.0f} s")
 st.plotly_chart(viz_race.fig_np_curve(curve, sel), use_container_width=True)
 
-st.markdown("**What-if (even pacing, same NP unless stated)**")
+st.markdown("**What-if (even pacing, same NP unless stated; power changes are on the simulated NP/VI scale)**")
 wi = cached_whatif(course, rider, env, key, np_target)
 st.dataframe(wi[["scenario", "time", "saved_s"]].rename(columns={"saved_s": "time saved (s)"}).round(1),
              use_container_width=True, hide_index=True)
@@ -220,7 +239,7 @@ st.subheader("5. Chainring recommendation")
 rings = list(range(46, 65))
 rec = chainring_recommendation(even, rings, rider.cassette)
 best = int(rec.iloc[0]["chainring"])
-st.success(f"Best chainring for this course at {np_target:.0f} W NP: **{best}T** "
+st.success(f"Best chainring for this course at {np_race:.0f} W NP: **{best}T** "
            f"(cassette {rider.cassette[0]}-{rider.cassette[-1]}).")
 st.dataframe(rec.round(1), use_container_width=True, hide_index=True)
 top = sorted(rec["chainring"].head(5).astype(int))
@@ -238,31 +257,59 @@ except ValueError as exc:
     st.warning(f"Could not read setups: {exc}")
 if setups:
     srec = setup_recommendation(even, setups, rider.cassette)
-    st.success(f"Best setup for this course at {np_target:.0f} W NP: **{srec.iloc[0]['setup']}**")
+    st.success(f"Best setup for this course at {np_race:.0f} W NP: **{srec.iloc[0]['setup']}**")
     cols = [c for c in ["setup", "mid4_pct", "ends_pct", "out_of_range_pct", "cross_chain_pct",
                         "cadence_err_mean", "front_shifts_per_hour", "aero_penalty_w", "score"] if c in srec.columns]
     st.dataframe(srec[cols].round(2), use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------- optimisation
 st.subheader("6. Optimise pacing")
+st.info("Be realistic: a well-chosen plan typically saves about 0.5-1% of race time over even pacing, and only "
+        "if you can actually hold the power targets. Gains much larger than that usually come from surges that no "
+        "rider can repeat, so judge the result by the peak powers and the equal-effort figure below.")
 o1, o2, o3 = st.columns(3)
-block_m = o1.select_slider("Block length", [500, 1000, 1500, 2000], 1000, format_func=lambda m: f"{m} m")
-bound = o2.slider("Power bounds (± % of NP)", 5, 50, 25)
-smooth = o3.slider("Smoothness penalty", 0.0, 5.0, 0.0, 0.5)
+block_m = o1.select_slider("Block length", [500, 1000, 1500, 2000], 1000,
+                           format_func=lambda m: f"{m} m" + (" (aggressive)" if m < 1000 else ""),
+                           help="Shorter blocks chase every roll in the road and ask for more surging; 500 m is "
+                                "labelled aggressive. 1 km is the recommended default.")
+bound = o2.slider("Power bounds (± % of NP)", 5, 50, 15)
+smooth = o3.slider("Smoothness penalty", 0.0, 5.0, 0.0, 0.5,
+                   help="Penalises changes between adjacent blocks; normalised per km so it means the same at every "
+                        "block length.")
+use_caps = st.checkbox("Cap rolling power (keeps the plan rideable)", value=True,
+                       help="The NP constraint alone only limits variability over ~30 s. These caps (% of the "
+                            "simulated NP) stop the optimiser asking for long hard surges.")
+cc1, cc2 = st.columns(2)
+cap1 = cc1.number_input("1-minute power cap (% of NP)", 100.0, 150.0, 110.0, 1.0, disabled=not use_caps)
+cap5 = cc2.number_input("5-minute power cap (% of NP)", 100.0, 140.0, 106.0, 1.0, disabled=not use_caps)
+caps = ((60, float(cap1)), (300, float(cap5))) if use_caps else ()
 if st.button("Optimise pacing", type="primary"):
-    st.session_state["opt"] = (key, np_target, cached_opt(course, rider, env, key, np_target, block_m, bound, smooth))
+    st.session_state["opt"] = (key, np_target,
+                               cached_opt(course, rider, env, key, np_target, block_m, bound, smooth, caps))
 
 res = st.session_state.get("opt")
 if res and res[0] == key and res[1] == np_target:
     opt = res[2]
+    race_s = opt.even.total_time_s
     a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Even", fmt_time(opt.even.total_time_s))
-    a2.metric("Optimised", fmt_time(opt.optimised.total_time_s), f"-{opt.time_saved_s:.0f} s")
-    a3.metric("Optimised NP / VI", f"{opt.optimised.np_w:.0f} W / {opt.optimised.vi:.3f}")
-    a4.metric("Avg power (even → opt)", f"{opt.even.avg_power:.0f} → {opt.optimised.avg_power:.0f} W")
+    a1.metric("Even", fmt_time(race_s))
+    a2.metric("Optimised", fmt_time(opt.optimised.total_time_s),
+              f"-{opt.time_saved_s:.0f} s ({100 * opt.time_saved_s / race_s:.2f}% of race time)")
+    a3.metric("Saved at equal effort (same 120 s NP)", f"{opt.saved_equal_np120_s:.0f} s",
+              help="The optimised plan scaled up or down until its 120 s normalised power matches even pacing's, "
+                   "so surges are not rewarded with a lower overall effort.")
+    a4.metric("Optimised NP / VI", f"{opt.optimised.np_w:.0f} W / {opt.optimised.vi:.3f}")
     if not opt.success:
         st.info("The optimiser could not beat even pacing here; showing even pacing.")
+    elif opt.converged:
+        st.caption("Solver converged.")
+    for msg in opt.cautions:
+        st.warning(msg)
+    stt = opt.stats_table().rename(columns={"metric": "Power metric", "even_w": "Even (W)",
+                                            "optimised_w": "Optimised (W)", "diff_w": "Difference (W)"})
+    st.dataframe(stt.round(1), use_container_width=True, hide_index=True)
     st.plotly_chart(viz_race.fig_speed_power(opt.even, opt.optimised), use_container_width=True)
+    st.plotly_chart(viz_race.fig_rolling_power(opt), use_container_width=True)
     st.plotly_chart(viz_race.fig_pacing_blocks(opt), use_container_width=True)
     km = opt.km_table()
     st.dataframe(km, use_container_width=True, hide_index=True)

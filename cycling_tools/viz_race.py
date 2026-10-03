@@ -171,3 +171,24 @@ def fig_pacing_blocks(opt, show_even: bool = True) -> go.Figure:
     fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), title="Optimised power targets (% of NP)",
                       xaxis_title="Distance (km)", yaxis_title="% of NP")
     return fig
+
+
+def fig_rolling_power(opt) -> go.Figure:
+    """1-minute and 5-minute rolling power for even vs optimised pacing, with the rolling-power caps (dashed)."""
+    from .simulate import rolling_mean
+
+    fig = go.Figure()
+    for res, name, col in ((opt.even, "Even", EVEN_COLOUR), (opt.optimised, "Optimised", OPT_COLOUR)):
+        p1 = res.power_1hz
+        for win, dash, label in ((60, "solid", "1 min"), (300, "dot", "5 min")):
+            r = rolling_mean(p1, win)
+            t = (np.arange(len(r)) + win / 2.0) / 60.0
+            sl = _thin(len(r), 1500)
+            fig.add_trace(go.Scatter(x=t[sl], y=r[sl], name=f"{name} {label}", line=dict(color=col, width=1.4, dash=dash),
+                                     hovertemplate="%{x:.0f} min %{y:.0f} W<extra>" + f"{name} {label}</extra>"))
+    for win, cap in sorted(opt.power_caps.items()):
+        fig.add_hline(y=cap / 100.0 * opt.np_target, line_dash="dash", line_color="#c0392b",
+                      annotation_text=f"{win // 60}-min cap {cap:.0f}% NP", annotation_position="top left")
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), title="Rolling power (1 min solid, 5 min dotted)",
+                      xaxis_title="Time (min)", yaxis_title="W", hovermode="x unified")
+    return fig
