@@ -1,6 +1,19 @@
+# environments and caches
 .venv
 .cache
+.pytest_cache
 __pycache__
+*.pyc
+
+# editors / OS
 .DS_Store
 .idea
+.claude
+
+# personal data: your own profile and scratch pickles stay local
 rider_profile.json
+*.pkl
+
+# personal ride files with home-area GPS traces: keep local, do not publish
+Fit_files/Outlaw_Nottingham.fit
+Fit_files/Morning_Gravel_Ride.fit

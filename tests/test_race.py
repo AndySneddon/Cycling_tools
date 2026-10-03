@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -21,7 +20,7 @@ from cycling_tools.optimise import optimise_pacing  # noqa: E402
 from cycling_tools.simulate import np_window, rolling_peak  # noqa: E402
 from cycling_tools.physics import normalised_power  # noqa: E402
 from cycling_tools.profile import RiderProfile  # noqa: E402
-from cycling_tools.simulate import (DEFAULT_RHO, Environment, SimConfig, simulate, simulate_even,  # noqa: E402
+from cycling_tools.simulate import (Environment, SimConfig, simulate, simulate_even,  # noqa: E402
                                     splits_table, time_vs_np, what_if)
 from cycling_tools.weather import constant_weather  # noqa: E402
 

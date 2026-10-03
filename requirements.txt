@@ -1,11 +1,11 @@
-pandas
-numpy
-matplotlib
-scipy
-fitparse
-plotly
-streamlit
-gpxpy
-numba
-requests
-pytest
+numpy>=2.0
+pandas>=2.2
+scipy>=1.13
+numba>=0.60
+fitparse>=1.2
+gpxpy>=1.6
+requests>=2.31
+plotly>=5.24
+streamlit>=1.50
+matplotlib>=3.8   # only used by the legacy Fit_files/Fit_file_parser.py
+pytest>=8

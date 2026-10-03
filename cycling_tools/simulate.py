@@ -10,7 +10,7 @@ import pandas as pd
 from scipy.optimize import brentq
 
 from .course import Course
-from .physics import G, WHEEL_INERTIA_KG, air_density, headwind_component, normalised_power
+from .physics import WHEEL_INERTIA_KG, air_density, headwind_component, normalised_power
 from .profile import RiderProfile
 from .weather import Weather
 

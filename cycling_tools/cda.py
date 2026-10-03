@@ -9,7 +9,7 @@ Model (per sample)::
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -22,7 +22,7 @@ import os
 from .fit_io import Ride
 from .geo import angle_diff_deg, bearing_deg, smooth_heading_deg
 from .physics import G, WHEEL_INERTIA_KG, air_density, standard_pressure_pa
-from .weather import Weather, WeatherError, constant_weather, fetch_weather
+from .weather import Weather, WeatherError, fetch_weather
 
 WIND_SCAN_SCALES = np.round(np.arange(0.0, 1.2001, 0.05), 2)
 FLAT_ALT_RANGE_M = 40.0      # selected-lap altitude range (p1-p99) below this counts as flat
