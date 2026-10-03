@@ -208,6 +208,106 @@ def test_no_gps_degrades_gracefully():
     assert np.isfinite(res.cda)
 
 
+def test_auto_wind_scale_finds_truth_and_reports_stability():
+    ride, *_ = synth_ride(seed=12)
+    res = analyse_ride(ride, _cfg(), weather=_weather())  # default wind_scale="auto"
+    wa = res.wind_auto
+    assert wa is not None and wa["auto"]
+    assert wa["used"] == pytest.approx(0.7, abs=0.2)
+    assert res.meta["wind_scale_used"] == pytest.approx(wa["used"])
+    assert len(wa["thirds"]) == 3 and np.isfinite(wa["third_range"])
+    assert abs(wa["head_minus_tail"]) < 0.05
+    assert res.cda == pytest.approx(TRUE_CDA, rel=0.05)
+    # a manual numeric scale is respected
+    man = analyse_ride(ride, _cfg(wind_scale=0.3), weather=_weather())
+    assert man.meta["wind_scale_used"] == 0.3 and not man.wind_auto["auto"]
+
+
+def test_wind_scan_uses_per_scale_mask_and_split():
+    from cycling_tools.cda import _scaled_series
+    ride, *_ = synth_ride(seed=13)
+    cfg = _cfg(wind_scale=0.7)
+    cfg.masks.min_airspeed_ms = 8.5  # airspeed mask now depends strongly on the scale
+    res = analyse_ride(ride, cfg, weather=_weather())
+    scan = wind_scale_scan(res, [0.0, 0.7, 1.4])
+    assert scan["n_valid"].nunique() > 1  # masks differ between scales (old code reused the configured-scale mask)
+    row = scan.set_index("wind_scale").loc[0.7]
+    assert row["n_valid"] == res.n_valid and row["cda"] == pytest.approx(res.cda, rel=1e-9)
+    # the head/tail split follows the scaled wind: at scale 0 there is no wind, so no head/tail subsets
+    assert np.isnan(scan.set_index("wind_scale").loc[0.0, "cda_head"])
+    # re-applying the used scale reproduces the prepared aero terms
+    t = _scaled_series(res.series, 0.7, cfg)
+    np.testing.assert_allclose(t["x"], res.series["x"])
+    np.testing.assert_allclose(t["v_air"], res.series["v_air"])
+
+
+def test_crr_sensitivity_and_prior_joint_fit():
+    ride, *_ = synth_ride(seed=14)
+    res = analyse_ride(ride, _cfg(wind_scale=0.7), weather=_weather())
+    assert -0.02 < res.crr_sensitivity < -0.005  # about -0.010 CdA per +0.001 Crr
+    j = res.joint
+    assert j["prior_mean"] == 0.0040 and j["prior_sd"] == 0.0008
+    assert 0.0016 < j["crr"] < 0.0064  # within 3 prior sd; the unconstrained fit wandered to 0.008-0.030
+    fit = analyse_ride(ride, _cfg(wind_scale=0.7, fit_crr=True), weather=_weather())
+    assert fit.crr == pytest.approx(fit.joint["crr"]) and 0.0016 < fit.crr < 0.0064
+
+
+def test_uncertainty_defaults_and_systematic_range():
+    assert CdAConfig().block_s == 600 and CdAConfig().wind_scale == "auto" and CdAConfig().alt_smooth_s == "auto"
+    ride, *_ = synth_ride(seed=15)
+    res = analyse_ride(ride, _cfg(), weather=_weather())
+    sr = res.sys_range
+    assert sr["half"] >= max(sr["crr_half"], sr["wind_half"], sr["eff_half"]) - 1e-12
+    assert sr["crr_half"] == pytest.approx(abs(res.crr_sensitivity), rel=0.2)
+    assert sr["lo"] < res.cda < sr["hi"]
+    assert res.meta["ci_block_s"] <= 600
+
+
+def test_altitude_smoothing_auto_and_override():
+    ride, *_ = synth_ride(seed=16)
+    flat = Ride("flat", ride.df.assign(alt=ride.df["alt"] * 0.1), pd.DataFrame())
+    hilly = Ride("hilly", ride.df.assign(alt=ride.df["alt"] * 5.0), pd.DataFrame())
+    assert analyse_ride(flat, _cfg(), weather=_weather()).meta["alt_smooth_used"] >= 41
+    assert analyse_ride(hilly, _cfg(), weather=_weather()).meta["alt_smooth_used"] == 21
+    assert analyse_ride(flat, _cfg(alt_smooth_s=11), weather=_weather()).meta["alt_smooth_used"] == 11
+
+
+def test_virtual_elevation_skips_masked_rows_consistently():
+    ride, *_ = synth_ride(seed=17)
+    cfg = _cfg(wind_mode="manual", manual_wind_ms=WIND_TRUE, manual_wind_from_deg=WIND_FROM)
+    res = analyse_ride(ride, cfg)
+    s = res.series.copy()
+    base = virtual_elevation(s, TRUE_CDA, TRUE_CRR, cfg)
+    # garbage in rows the fit excludes (coasting/braking/etc.) must not move the virtual elevation
+    bad = np.flatnonzero(~s["valid"].to_numpy())[:40]
+    assert len(bad) == 40
+    s2 = s.copy()
+    s2.loc[s2.index[bad], "p_wheel"] = 3000.0
+    s2.loc[s2.index[bad], "accel"] = 2.0
+    np.testing.assert_allclose(virtual_elevation(s2, TRUE_CDA, TRUE_CRR, cfg)["ve"], base["ve"])
+    # NaN rows are treated the same way (follow the altitude) instead of silently contributing zero rise
+    s3 = s.copy()
+    s3.loc[s3.index[1000:1030], "p_wheel"] = np.nan
+    s3.loc[s3.index[1000:1030], "valid"] = True
+    ve3 = virtual_elevation(s3, TRUE_CDA, TRUE_CRR, cfg)["ve"].to_numpy()
+    assert np.isfinite(ve3).all()
+    # VE stays linear in CdA (fit_cda_ve relies on this) with masked rows present
+    v0, v1, v2 = (virtual_elevation(s, c, TRUE_CRR, cfg)["ve"].to_numpy() for c in (0.1, 0.2, 0.3))
+    np.testing.assert_allclose(v2 - v1, v1 - v0, atol=1e-6)
+
+
+def test_confidence_badge():
+    from dataclasses import replace
+
+    from cycling_tools.cda import assess_confidence
+    ride, *_ = synth_ride(seed=18)
+    res = analyse_ride(ride, _cfg(), weather=_weather())
+    assert res.confidence["level"] in ("High", "Medium", "Low")
+    assert {i["name"] for i in res.confidence["items"]} >= {"Head/tail gap", "Valid data", "Systematic range"}
+    worse = replace(res, wind_auto={**res.wind_auto, "head_minus_tail": 0.12}, sys_range={**res.sys_range, "half": 0.06})
+    assert assess_confidence(worse)["level"] == "Low"
+
+
 def test_real_manchester_tt_lap2():
     from pathlib import Path
     from cycling_tools.cda import try_fetch_weather

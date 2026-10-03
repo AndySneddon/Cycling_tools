@@ -17,8 +17,7 @@ from cycling_tools.branding import apply_branding
 
 from cycling_tools import viz_cda as vz
 from cycling_tools.cda import (
-    REASON_LABELS, CdAConfig, MaskConfig, analyse_ride, best_wind_scale, fit_cda_ve, try_fetch_weather,
-    wind_scale_scan,
+    CRR_STEP, EFF_REL, CdAConfig, MaskConfig, analyse_ride, best_wind_scale, fit_cda_ve, try_fetch_weather,
 )
 from cycling_tools.fit_io import load_fit
 from cycling_tools.physics import normalised_power
@@ -35,21 +34,21 @@ FIT_DIR = ROOT / "Fit_files"
 profile = RiderProfile.load()
 
 
-@st.cache_data(show_spinner="Parsing FIT file...")
+@st.cache_data(show_spinner="Parsing FIT file...", max_entries=8)
 def _load(key: str, data: bytes | None):
     return load_fit(FIT_DIR / key) if data is None else load_fit(data, name=key)
 
 
-@st.cache_data(show_spinner="Fetching weather...")
+@st.cache_data(show_spinner="Fetching weather...", max_entries=16)
 def _weather(key: str, _ride, laps: tuple):
     return try_fetch_weather(_ride, list(laps) or None)
 
 
-@st.cache_data(show_spinner="Analysing ride...")
-def _analyse(key: str, _ride, cfg_dict: dict, _weather_obj, wx_key: str, laps: tuple, scan: bool):
+@st.cache_data(show_spinner="Analysing ride...", max_entries=16)
+def _analyse(key: str, _ride, cfg_dict: dict, _weather_obj, wx_key: str, laps: tuple):
     cfg_dict = dict(cfg_dict)
     cfg_dict["masks"] = MaskConfig(**cfg_dict["masks"])
-    return analyse_ride(_ride, CdAConfig(**cfg_dict), weather=_weather_obj, laps=list(laps) or None, scan_wind=scan)
+    return analyse_ride(_ride, CdAConfig(**cfg_dict), weather=_weather_obj, laps=list(laps) or None)
 
 
 # ------------------------------------------------------------------ sidebar
@@ -90,27 +89,38 @@ with st.sidebar:
 
     st.header("Rider & bike")
     mass = st.number_input("System mass (kg)", 40.0, 200.0, float(profile.mass_kg), 0.5)
-    crr = st.number_input("Crr", 0.001, 0.015, float(profile.crr), 0.0001, format="%.4f")
+    crr = st.number_input("Crr", 0.001, 0.015, float(profile.crr), 0.0001, format="%.4f",
+                          help="Typical: smooth tarmac 0.003-0.004, real roads 0.004-0.006. CdA and Crr are only valid "
+                               "as a PAIR: the race planner uses the profile Crr together with the profile CdA, so "
+                               "use the Crr you want to race with. Each +0.001 Crr lowers the fitted CdA by about 0.010.")
+    st.caption("Smooth tarmac 0.003-0.004, real roads 0.004-0.006. CdA is only valid with this Crr.")
     eff = st.number_input("Drivetrain efficiency", 0.90, 1.0, float(profile.drivetrain_eff), 0.005)
-    fit_crr = st.checkbox("Fit Crr jointly (needs varied speed)", value=False)
+    fit_crr = st.checkbox("Joint CdA + Crr fit (Gaussian prior on Crr)", value=False,
+                          help="Crr ~ N(0.0040, 0.0008). An unconstrained joint fit returns absurd Crr (0.008-0.030) "
+                               "because CdA and Crr are almost collinear; treat this as a diagnostic.")
 
     st.header("Weather / wind")
     src = st.radio("Source", ["Open-Meteo (auto)", "Manual", "None"], index=0)
-    wind_scale = st.slider("Wind scale (10 m -> rider)", 0.0, 1.5, float(profile.wind_scale), 0.05,
-                           disabled=src != "Open-Meteo (auto)")
+    auto_ws = st.checkbox("Automatic wind scale (minimise residual)", value=True, disabled=src != "Open-Meteo (auto)",
+                          help="Scans 0 to 1.2 and picks the scale with the lowest Huber loss. Untick to set it by hand.")
+    wind_scale = st.slider("Wind scale (10 m -> rider)", 0.0, 1.5, float(np.clip(profile.wind_scale, 0.0, 1.5)), 0.05,
+                           disabled=src != "Open-Meteo (auto)" or auto_ws)
     man_ws = man_wd = man_t = None
     if src == "Manual":
         man_ws = st.number_input("Wind speed at rider (m/s)", 0.0, 25.0, 0.0, 0.5)
         man_wd = st.number_input("Wind from (deg, 0 = N)", 0.0, 359.0, 0.0, 5.0)
         man_t = st.number_input("Air temperature (C)", -20.0, 45.0, 15.0, 0.5)
-    do_scan = st.checkbox("Scan wind scale (diagnostic)", value=False, disabled=src == "None")
 
     with st.expander("Smoothing & fit"):
         sm_v = st.slider("Speed smoothing (s)", 1, 15, 5)
         sm_p = st.slider("Power smoothing (s)", 1, 15, 5)
-        sm_a = st.slider("Altitude smoothing (s)", 5, 61, 21, 2)
+        auto_alt = st.checkbox("Automatic altitude smoothing", value=True,
+                               help="41 s when the selected laps are flat (altitude range < 40 m), otherwise 21 s.")
+        sm_a = st.slider("Altitude smoothing (s)", 5, 61, 21, 2, disabled=auto_alt)
         roll_w = st.slider("Rolling CdA window (s)", 30, 600, 120, 10)
         boots = st.slider("Bootstrap resamples", 0, 500, 150, 10)
+        block = st.slider("Bootstrap block length (s)", 30, 900, 600, 30,
+                          help="Longer blocks respect the autocorrelation of the errors; 30 s blocks understate the CI.")
 
     mc = MaskConfig()
     with st.expander("Mask thresholds"):
@@ -147,14 +157,16 @@ elif src == "Manual":
     weather = constant_weather(temp_c=man_t, wind_ms=0.0)
 
 cfg_obj = CdAConfig(
-    mass_kg=mass, crr=crr, fit_crr=fit_crr, drivetrain_eff=eff, wind_mode=wind_mode, wind_scale=wind_scale,
+    mass_kg=mass, crr=crr, fit_crr=fit_crr, drivetrain_eff=eff, wind_mode=wind_mode,
+    wind_scale="auto" if auto_ws else float(wind_scale),
     manual_wind_ms=man_ws or 0.0, manual_wind_from_deg=man_wd or 0.0, speed_smooth_s=sm_v,
-    power_smooth_s=sm_p, alt_smooth_s=sm_a, rolling_window_s=roll_w, bootstrap_n=boots, masks=mc,
+    power_smooth_s=sm_p, alt_smooth_s="auto" if auto_alt else int(sm_a), rolling_window_s=roll_w, bootstrap_n=boots,
+    block_s=int(block), masks=mc,
 )
 cfg_dict = asdict(cfg_obj)
 wx_key = (weather.source if weather is not None else "none") + (f"{man_t}" if src == "Manual" else "")
 try:
-    res = _analyse(ride.name, ride, cfg_dict, weather, wx_key, tuple(sel_laps), bool(do_scan and wind_mode != "none"))
+    res = _analyse(ride.name, ride, cfg_dict, weather, wx_key, tuple(sel_laps))
 except ValueError as e:
     st.error(str(e))
     st.stop()
@@ -167,12 +179,25 @@ for w in warnings_ui + res.warnings:
 
 # ------------------------------------------------------------------ headline
 lo, hi = res.cda_ci
-c1, c2, c3, c4, c5 = st.columns(5)
+sr = res.sys_range or {}
+conf = res.confidence or {"level": "n/a", "items": []}
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("CdA (m²)", f"{res.cda:.3f}")
-c2.metric("95% CI", f"{lo:.3f} - {hi:.3f}" if np.isfinite(lo) else "n/a")
-c3.metric("Crr used", f"{res.crr:.4f}")
-c4.metric("Valid data", f"{res.valid_pct:.0f}%", f"{res.n_valid} s")
-c5.metric("Air density", f"{res.meta['rho_mean']:.3f} kg/m³")
+c2.metric("95% CI (sampling)", f"{lo:.3f} - {hi:.3f}" if np.isfinite(lo) else "n/a",
+          help=f"Moving-block bootstrap, {res.meta.get('ci_block_s', '?')} s blocks. Sampling noise only.")
+c3.metric("Systematic range", f"±{sr['half']:.3f}" if sr else "n/a",
+          help=f"Crr ±{CRR_STEP:.3f}: ±{sr.get('crr_half', 0):.3f}; wind-scale optimum across thirds: "
+               f"±{sr.get('wind_half', 0):.3f}; drivetrain efficiency ±{EFF_REL * 100:.1f}%: ±{sr.get('eff_half', 0):.3f}. "
+               "Combined in quadrature. Power-meter bias is NOT included.")
+c4.metric("Crr used", f"{res.crr:.4f}", f"{res.crr_sensitivity:+.3f} CdA per +0.001 Crr", delta_color="off")
+c5.metric("Valid data", f"{res.valid_pct:.0f}%", f"{res.n_valid} s")
+c6.metric("Confidence", conf["level"], help="From head/tail CdA gap, wind-scale stability, valid data and systematic range (see below).")
+with st.expander(f"Why {conf['level']} confidence?"):
+    for it in conf["items"]:
+        mark = {2: "good", 1: "fair", 0: "poor", None: "n/a"}[it["grade"]]
+        st.write(f"- **{it['name']}** ({mark}): {it['text']}")
+    st.caption("The CI and systematic range do not include power-meter bias or mass error: a 2% power-meter error "
+               "is about a 2% CdA error. CdA is only valid together with the Crr used.")
 
 # Power summary for the selected laps (all samples, including coasting), for use in the Race Planner
 sel = res.series[res.series["selected"]]
@@ -190,14 +215,25 @@ if sel_power.size >= 30:
     dist_km = float(sel["dist_km"].iloc[-1] - sel["dist_km"].iloc[0]) if "dist_km" in sel else float("nan")
     p5.metric("Average speed", f"{dist_km / (secs / 3600):.1f} km/h" if np.isfinite(dist_km) and secs else "n/a")
     st.caption("Use these in the Race Planner: set the target NP and expected VI to the values above.")
-st.caption(f"Wind: {res.meta['wind_source']} (scale {res.meta['wind_scale_used']:.2f}); density: {res.meta['rho_source']}; "
-           f"residual RMS {res.resid_rms_w:.0f} W. The CI reflects sampling noise only, not systematic error "
-           "(wind, mass, Crr, power-meter calibration).")
+wa = res.wind_auto
+wind_txt = (f"Wind: {res.meta['wind_source']} (scale {res.meta['wind_scale_used']:.2f}"
+            + (", automatic" if wa and wa["auto"] else "") + ")")
+if wa:
+    wind_txt += (f"; head-minus-tail CdA {wa['head_minus_tail']:+.3f}; optimum across thirds "
+                 + " / ".join(f"{t:.2f}" for t in wa["thirds"]))
+st.caption(f"{wind_txt}; density: {res.meta['rho_source']} ({res.meta['rho_mean']:.3f} kg/m³); "
+           f"altitude smoothing {res.meta.get('alt_smooth_used', '-')} s; residual RMS {res.resid_rms_w:.0f} W. "
+           "The CI reflects sampling noise only; the systematic range adds Crr, wind scale and efficiency but not "
+           "power-meter bias.")
 if res.joint and fit_crr is False:
-    with st.expander("Joint CdA + Crr fit (diagnostic)"):
+    with st.expander("Joint CdA + Crr fit with Crr prior (diagnostic)"):
         j = res.joint
-        st.write(f"CdA {j['cda']:.3f}, Crr {j['crr']:.4f}; condition number {j['cond']:.1f}, "
-                 f"x/r correlation {j['corr']:.2f}. " + ("Poorly conditioned: do not trust." if j["ill_conditioned"] else "Reasonably conditioned."))
+        st.write(f"With a Gaussian prior Crr ~ N({j['prior_mean']:.4f}, {j['prior_sd']:.4f}): CdA {j['cda']:.3f}, "
+                 f"Crr {j['crr']:.4f} ± {j['crr_sd']:.4f}; condition number {j['cond']:.1f}, x/r correlation "
+                 f"{j['corr']:.2f}. " + ("The data barely inform Crr here (estimate is mostly the prior): do not "
+                                           "trust it." if j["ill_conditioned"] else "The data do inform Crr."))
+        st.caption("Rule of thumb: CdA falls by about 0.010 per +0.001 Crr. Use the fixed-Crr CdA above, with a Crr "
+                   "you will also race with.")
 
 tabs = st.tabs(["Series", "Map", "Diagnostics", "Laps & energy", "Virtual elevation", "Masks"])
 with tabs[0]:
@@ -233,10 +269,13 @@ with tabs[2]:
     b.dataframe(res.speed_split.round(3), hide_index=True)
     if res.wind_scan is not None:
         st.subheader("Wind scale scan")
-        st.plotly_chart(vz.wind_scan_figure(res.wind_scan), width="stretch")
         bw = best_wind_scale(res.wind_scan)
+        st.plotly_chart(vz.wind_scan_figure(res.wind_scan, opt=bw["by_loss"]), width="stretch")
         st.write(f"Best scale by residual: **{bw['by_loss']:.2f}**; where head/tail CdA balance: "
                  f"**{bw['by_balance']:.2f}**" if np.isfinite(bw["by_balance"]) else f"Best scale by residual: **{bw['by_loss']:.2f}**")
+        if wa:
+            st.write(f"Optimum by thirds of the ride: {' / '.join(f'{t:.2f}' for t in wa['thirds'])} "
+                     f"(spread {wa['third_range']:.2f}). Each scale in the scan uses its own validity mask.")
 with tabs[3]:
     st.subheader("Per lap")
     st.plotly_chart(vz.laps_figure(res), width="stretch")
@@ -269,15 +308,17 @@ with tabs[5]:
 
 # ------------------------------------------------------------------ save
 st.divider()
-if st.button("Save CdA to rider profile"):
+st.caption("CdA and Crr are saved together: the race planner uses both, and this CdA is only valid with this Crr.")
+if st.button("Save CdA + Crr to rider profile"):
     p = RiderProfile.load()
     p.cda = round(float(res.cda), 4)
     p.crr = round(float(res.crr), 5)
-    p.wind_scale = float(wind_scale)
+    p.wind_scale = round(float(res.meta["wind_scale_used"]), 3) if res.meta.get("wind_mode_used") == "weather" else float(p.wind_scale)
     p.mass_kg = float(mass)
     p.drivetrain_eff = float(eff)
     try:
         p.save()
-        st.success(f"Saved CdA {p.cda:.3f}, Crr {p.crr:.4f}, wind scale {p.wind_scale:.2f}, mass {p.mass_kg:.1f} kg.")
+        st.success(f"Saved as a pair: CdA {p.cda:.3f} with Crr {p.crr:.4f} (wind scale {p.wind_scale:.2f}, "
+                   f"mass {p.mass_kg:.1f} kg).")
     except OSError as e:
         st.error(f"Could not write profile: {e}")

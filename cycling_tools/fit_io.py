@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from fitparse import FitFile
 
+from . import fitfast
 from .geo import path_distance_m, semicircles_to_degrees
 
 MAX_INTERP_GAP_S = 3  # fill dropouts up to this long; longer gaps stay NaN
@@ -52,16 +53,21 @@ def load_fit(source: str | Path | bytes | io.BytesIO, name: str | None = None) -
     """Parse a FIT file (path, bytes or file-like) into a :class:`Ride`."""
     if isinstance(source, (str, Path)):
         name = name or Path(source).name
-        fit = FitFile(str(source))
+        data = Path(source).read_bytes()
     else:
         data = source if isinstance(source, (bytes, bytearray)) else source.read()
-        fit = FitFile(io.BytesIO(data))
         name = name or "upload.fit"
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        raw = _messages(fit, "record")
-        laps_raw = _messages(fit, "lap")
+    try:  # fast numpy decoder for the two message types we need (~100x faster than fitparse)
+        raw, laps_raw = fitfast.read_messages(bytes(data))
+        if raw.empty or "timestamp" not in raw.columns:
+            raise fitfast.FitDecodeError("no records")
+    except Exception:  # unusual layout (chained file, compressed timestamps...): use the reference parser
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fit = FitFile(io.BytesIO(data))
+            raw = _messages(fit, "record")
+            laps_raw = _messages(fit, "lap")
 
     if raw.empty or "timestamp" not in raw.columns:
         raise ValueError(f"{name}: no record messages found in FIT file.")
@@ -132,7 +138,8 @@ def _prepare_laps(laps_raw: pd.DataFrame) -> pd.DataFrame:
             "end": start + pd.to_timedelta(dur, unit="s"),
             "duration_s": dur,
             "distance_km": pd.to_numeric(laps.get("total_distance"), errors="coerce") / 1000.0,
-            "avg_power": pd.to_numeric(laps.get("avg_power"), errors="coerce"),
+            # float64 always (NaN when missing) so the fast decoder and the fitparse fallback agree on dtype
+            "avg_power": pd.to_numeric(laps.get("avg_power"), errors="coerce").astype(float),
             "avg_speed_kmh": _coalesce(laps, "enhanced_avg_speed", "avg_speed") * 3.6,
         }
     )

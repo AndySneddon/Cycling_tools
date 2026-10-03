@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -92,14 +91,19 @@ def map_figure(res: CdAResult) -> go.Figure:
         return go.Figure().update_layout(title="No GPS data")
     vals = s["rolling_cda"]
     lo, hi = (np.nanpercentile(vals, [5, 95]) if vals.notna().any() else (0.2, 0.3))
-    fig = px.scatter_map(s, lat="lat", lon="lon", color="rolling_cda", color_continuous_scale="Turbo",
-                         range_color=(lo, hi), height=520,
-                         center=dict(lat=float((s["lat"].min() + s["lat"].max()) / 2),
-                                     lon=float((s["lon"].min() + s["lon"].max()) / 2)),
-                         zoom=_fit_zoom(s["lat"], s["lon"]),
-                         hover_data={"speed": ":.1f", "power": ":.0f", "lat": False, "lon": False})
-    fig.update_layout(map_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0),
-                      coloraxis_colorbar=dict(title="CdA"))
+    # go.Scattermap directly: px.scatter_map spends ~250 ms in px/layout validation for the same picture
+    fig = go.Figure(go.Scattermap(
+        lat=s["lat"].to_numpy(), lon=s["lon"].to_numpy(), mode="markers",
+        marker=dict(size=6, color=vals.to_numpy(), colorscale="Turbo", cmin=float(lo), cmax=float(hi),
+                    colorbar=dict(title="CdA")),
+        customdata=np.column_stack([s["speed"].to_numpy(), s["power"].to_numpy()]),
+        hovertemplate="CdA %{marker.color:.3f}<br>%{customdata[0]:.1f} m/s, %{customdata[1]:.0f} W<extra></extra>"))
+    fig.update_layout(
+        height=520, map=dict(style="open-street-map",
+                             center=dict(lat=float((s["lat"].min() + s["lat"].max()) / 2),
+                                         lon=float((s["lon"].min() + s["lon"].max()) / 2)),
+                             zoom=_fit_zoom(s["lat"], s["lon"])),
+        margin=dict(l=0, r=0, t=0, b=0))
     return fig
 
 
@@ -132,7 +136,10 @@ def scatter_figure(res: CdAResult, by: str = "speed") -> go.Figure:
 def histogram_figure(res: CdAResult) -> go.Figure:
     s = res.series
     d = s[(s["valid"] & s["selected"])]["rolling_cda"].dropna()
-    fig = px.histogram(d, nbins=40, height=360, labels={"value": "Rolling CdA (m²)"})
+    cnt, edges = np.histogram(d.to_numpy(float), bins=40)  # binned here: px.histogram costs ~100 ms and ships every sample
+    fig = go.Figure(go.Bar(x=0.5 * (edges[:-1] + edges[1:]), y=cnt, width=np.diff(edges) * 0.98,
+                           hovertemplate="CdA %{x:.3f}: %{y} s<extra></extra>"))
+    fig.update_layout(height=360, xaxis_title="Rolling CdA (m²)")
     fig.add_vline(x=res.cda, line=dict(dash="dash", color="black"))
     lo, hi = res.cda_ci
     if np.isfinite(lo):
@@ -181,12 +188,14 @@ def ve_figure(res: CdAResult, cda: float, crr: float, cfg: CdAConfig, start: int
     return fig
 
 
-def wind_scan_figure(scan: pd.DataFrame) -> go.Figure:
+def wind_scan_figure(scan: pd.DataFrame, opt: float | None = None) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(x=scan["wind_scale"], y=scan["cda_head"], name="CdA headwind"), secondary_y=False)
     fig.add_trace(go.Scatter(x=scan["wind_scale"], y=scan["cda_tail"], name="CdA tailwind"), secondary_y=False)
     fig.add_trace(go.Scatter(x=scan["wind_scale"], y=scan["rms_w"], name="Residual RMS (W)",
                              line=dict(dash="dot", color="grey")), secondary_y=True)
+    if opt is not None and np.isfinite(opt):
+        fig.add_vline(x=float(opt), line=dict(dash="dash", color="black"), annotation_text=f"best {opt:.2f}")
     fig.update_layout(height=360, xaxis_title="Wind scale", margin=dict(l=50, r=50, t=30, b=40))
     fig.update_yaxes(title_text="CdA (m²)", secondary_y=False, range=[0, 0.8])
     fig.update_yaxes(title_text="RMS (W)", secondary_y=True)

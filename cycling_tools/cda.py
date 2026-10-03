@@ -15,14 +15,21 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 from scipy.ndimage import binary_dilation
-from scipy.optimize import minimize_scalar
-from scipy.signal import savgol_filter
+
+from concurrent.futures import ThreadPoolExecutor
+import os
 
 from .fit_io import Ride
 from .geo import angle_diff_deg, bearing_deg, smooth_heading_deg
 from .physics import G, WHEEL_INERTIA_KG, air_density, standard_pressure_pa
 from .weather import Weather, WeatherError, constant_weather, fetch_weather
 
+WIND_SCAN_SCALES = np.round(np.arange(0.0, 1.2001, 0.05), 2)
+FLAT_ALT_RANGE_M = 40.0      # selected-lap altitude range (p1-p99) below this counts as flat
+ALT_SMOOTH_FLAT_S = 41
+ALT_SMOOTH_HILLY_S = 21
+CRR_STEP = 0.001             # +/- Crr used for the sensitivity / systematic range
+EFF_REL = 0.015              # +/- relative drivetrain-efficiency uncertainty
 REASONS = [
     "gap",
     "low_speed",
@@ -69,26 +76,33 @@ class MaskConfig:
 @dataclass
 class CdAConfig:
     mass_kg: float = 100.0
+    # Crr is only valid as a PAIR with the CdA it was fitted with (the race planner uses both from the rider profile),
+    # so the default is not changed here: the page reads it from the profile. Typical values: smooth tarmac
+    # 0.003-0.004, real roads 0.004-0.006; CdA moves by about -0.010 per +0.001 Crr (see CdAResult.crr_sensitivity).
     crr: float = 0.0031
+    # joint CdA+Crr fit WITH a Gaussian prior on Crr (an unconstrained fit returns absurd Crr of 0.008-0.030)
     fit_crr: bool = False
+    crr_prior_mean: float = 0.0040
+    crr_prior_sd: float = 0.0008
     drivetrain_eff: float = 0.97
     wheel_inertia_kg: float = WHEEL_INERTIA_KG
     # wind: "weather" (needs Weather, scaled by wind_scale), "manual", "none"
+    # wind_scale: a number (manual override) or "auto" = the scale (0..1.2) minimising the Huber loss, see auto_wind_scale
     wind_mode: str = "weather"
-    wind_scale: float = 0.7
+    wind_scale: float | str = "auto"
     manual_wind_ms: float = 0.0
     manual_wind_from_deg: float = 0.0
     rho_override: float | None = None
     speed_smooth_s: int = 5
     power_smooth_s: int = 5
-    alt_smooth_s: int = 21
+    alt_smooth_s: int | str = "auto"   # "auto": >= 41 s on flat selections (altitude range < FLAT_ALT_RANGE_M), else 21 s
     heading_span_s: int = 4
     heading_smooth_s: int = 5
     rolling_window_s: int = 120
     rolling_min_frac: float = 0.25
     huber_k: float = 1.345
     bootstrap_n: int = 200
-    block_s: int = 30
+    block_s: int = 600   # bootstrap block length (s): short blocks understate the CI (autocorrelated errors)
     seed: int = 0
     min_lap_valid_s: int = 60
     masks: MaskConfig = field(default_factory=MaskConfig)
@@ -115,6 +129,10 @@ class CdAResult:
     meta: dict
     warnings: list[str] = field(default_factory=list)
     wind_scan: pd.DataFrame | None = None
+    wind_auto: dict | None = None        # wind-scale optimum, thirds stability, head/tail gap (weather mode only)
+    crr_sensitivity: float = float("nan")  # CdA change for +0.001 Crr
+    sys_range: dict | None = None        # systematic range components and combined (quadrature) half-width
+    confidence: dict | None = None       # {"level": High/Medium/Low, "items": [...]}
 
     @property
     def valid_pct(self) -> float:
@@ -141,6 +159,47 @@ def _fill(a: np.ndarray) -> np.ndarray:
     return s.interpolate(limit_area="inside").ffill().bfill().to_numpy()
 
 
+try:
+    from numba import njit
+except ImportError:  # pragma: no cover
+    njit = None
+
+if njit is not None:
+    @njit(cache=True, nogil=True)
+    def _huber1_nb(x, y, k, iters):
+        """Single-regressor Huber IRLS through the origin: same algorithm as ``_huber`` for p == 1."""
+        n = x.shape[0]
+        sxy = 0.0
+        sxx = 0.0
+        for i in range(n):
+            sxy += x[i] * y[i]
+            sxx += x[i] * x[i]
+        beta = sxy / sxx
+        w = np.ones(n)
+        s = np.nan
+        r = np.empty(n)
+        for _ in range(iters):
+            for i in range(n):
+                r[i] = y[i] - x[i] * beta
+            med = np.median(r)
+            ar = np.abs(r - med)
+            s = max(1.4826 * np.median(ar), 1e-6)
+            num = 0.0
+            den = 0.0
+            for i in range(n):
+                u = abs(r[i]) / (k * s)
+                wi = 1.0 if u <= 1.0 else 1.0 / max(u, 1e-12)
+                w[i] = wi
+                num += wi * x[i] * y[i]
+                den += wi * x[i] * x[i]
+            nb = num / den
+            done = abs(nb - beta) <= 1e-10 + 1e-7 * abs(beta)
+            beta = nb
+            if done:
+                break
+        return beta, w, s
+
+
 def _huber(X: np.ndarray, y: np.ndarray, k: float = 1.345, iters: int = 40):
     """Huber IRLS regression. Returns (beta, weights, scale)."""
     X = np.asarray(X, dtype=float)
@@ -149,6 +208,9 @@ def _huber(X: np.ndarray, y: np.ndarray, k: float = 1.345, iters: int = 40):
     n, p = X.shape
     if n < max(p, 3):
         return np.full(p, np.nan), np.ones(n), np.nan
+    if p == 1 and njit is not None:
+        b, w, s = _huber1_nb(np.ascontiguousarray(X[:, 0]), np.ascontiguousarray(y, dtype=float), float(k), int(iters))
+        return np.array([b]), w, s
     beta = np.linalg.lstsq(X, y, rcond=None)[0]
     w = np.ones(n)
     s = np.nan
@@ -190,7 +252,8 @@ def try_fetch_weather(ride: Ride, laps: Sequence[int] | None = None) -> tuple[We
 
 # ----------------------------------------------------------------------------- preparation
 
-def _prepare(ride: Ride, cfg: CdAConfig, weather: Weather | None, laps) -> tuple[pd.DataFrame, list[str], dict]:
+def _prepare(ride: Ride, cfg: CdAConfig, weather: Weather | None, laps,
+             scale_override: float | None = None) -> tuple[pd.DataFrame, list[str], dict]:
     df = ride.df
     warn: list[str] = []
     meta: dict = {}
@@ -206,12 +269,23 @@ def _prepare(ride: Ride, cfg: CdAConfig, weather: Weather | None, laps) -> tuple
     p = _smooth(df["power"].to_numpy(float), cfg.power_smooth_s)
     a = np.gradient(v)
 
+    sel = np.ones(n, bool) if not laps else df["lap"].isin(list(laps)).to_numpy()
+
     # gradient from altitude
     alt_raw = df["alt"].to_numpy(float)
     if np.isfinite(alt_raw).sum() > 30:
         alt = _fill(alt_raw)
-        win = int(cfg.alt_smooth_s) | 1
+        if isinstance(cfg.alt_smooth_s, str):  # "auto": flatter selections need more smoothing (barometer noise)
+            a_sel = alt[sel] if sel.any() else alt
+            flat = (np.nanpercentile(a_sel, 99) - np.nanpercentile(a_sel, 1)) < FLAT_ALT_RANGE_M
+            alt_win = ALT_SMOOTH_FLAT_S if flat else ALT_SMOOTH_HILLY_S
+        else:
+            alt_win = int(cfg.alt_smooth_s)
+        meta["alt_smooth_used"] = alt_win
+        win = int(alt_win) | 1
         win = min(win, (len(alt) // 2) * 2 - 1) if len(alt) > 5 else 5
+        from scipy.signal import savgol_filter  # lazy: scipy.signal drags in scipy.stats (~0.5 s of import time)
+
         climb = savgol_filter(alt, max(win, 5), 2, deriv=1)
         with np.errstate(invalid="ignore", divide="ignore"):
             sin_t = np.where(v > 1.0, climb / np.where(v > 1.0, v, 1.0), 0.0)
@@ -268,7 +342,8 @@ def _prepare(ride: Ride, cfg: CdAConfig, weather: Weather | None, laps) -> tuple
         spd = wx["wind_ms"].to_numpy(float)
         frm = wx["wind_dir"].to_numpy(float)
         hw_raw = spd * np.cos(np.radians(frm - hd))
-        scale = cfg.wind_scale
+        ws = cfg.wind_scale
+        scale = float(scale_override) if scale_override is not None else (0.5 if isinstance(ws, str) else float(ws))
     elif mode == "manual":
         hw_raw = cfg.manual_wind_ms * np.cos(np.radians(cfg.manual_wind_from_deg - hd))
         scale = 1.0
@@ -277,6 +352,7 @@ def _prepare(ride: Ride, cfg: CdAConfig, weather: Weather | None, laps) -> tuple
     hw_raw = np.nan_to_num(hw_raw)
     hw = hw_raw * scale
     meta["wind_source"] = wind_src
+    meta["wind_mode_used"] = mode
     meta["wind_scale_used"] = scale
 
     # air density
@@ -307,8 +383,6 @@ def _prepare(ride: Ride, cfg: CdAConfig, weather: Weather | None, laps) -> tuple
     with np.errstate(invalid="ignore", divide="ignore"):
         implied_aero = y
         implied_cda = np.where(np.abs(x) > 1.0, y / x, np.nan)
-
-    sel = np.ones(n, bool) if not laps else df["lap"].isin(list(laps)).to_numpy()
 
     out = pd.DataFrame(
         {
@@ -382,22 +456,110 @@ def _solve(s: pd.DataFrame, idx: np.ndarray, cfg: CdAConfig, joint: bool = False
     return _huber(x, s["y0"].to_numpy()[idx] - cfg.crr * s["r"].to_numpy()[idx], cfg.huber_k)
 
 
-def _bootstrap(s: pd.DataFrame, fit_idx: np.ndarray, cfg: CdAConfig, joint: bool, crr_used: float):
-    if cfg.bootstrap_n <= 0 or len(fit_idx) < 2 * cfg.block_s:
+def _autocorr_tau(resid: np.ndarray, max_lag: int = 120) -> float:
+    """Integrated autocorrelation time of a residual series (NaN = missing): n samples carry about n/tau of
+    independent information. Used to deflate the data weight against the Crr prior (1 Hz data are strongly correlated)."""
+    e = np.asarray(resid, float)
+    ok = np.isfinite(e)
+    e = np.where(ok, e - np.nanmean(e), 0.0)
+    den = float(np.sum(e * e))
+    if den <= 0:
+        return 1.0
+    tau = 1.0
+    for k in range(1, min(max_lag, len(e) - 1)):
+        both = ok[:-k] & ok[k:]
+        rho = float(np.sum(e[:-k] * e[k:] * both)) / den * (len(e) / max(both.sum(), 1))
+        if rho <= 0:
+            break
+        tau += 2 * rho
+    return float(np.clip(tau, 1.0, 300.0))
+
+
+def _joint_prior(x, r, y0, k: float, mu: float, sd: float, tau: float, iters: int = 40):
+    """Huber-robust joint CdA + Crr fit with a Gaussian prior Crr ~ N(mu, sd) (MAP estimate).
+
+    Minimises  sum_i huber(res_i) / (tau * s^2)  +  (crr - mu)^2 / sd^2  with s the robust residual scale and tau
+    the residual autocorrelation time (so the 1 Hz samples are not treated as independent). Returns
+    (beta=[cda, crr], weights, s, cov 2x2).
+    """
+    x = np.asarray(x, float)
+    r = np.asarray(r, float)
+    y = np.asarray(y0, float)
+    n = len(x)
+    if n < 10:
+        return np.array([np.nan, np.nan]), np.ones(n), np.nan, np.full((2, 2), np.nan)
+    beta = np.array([np.sum(x * (y - mu * r)) / np.sum(x * x), mu])
+    w = np.ones(n)
+    s = np.nan
+    N = np.eye(2)
+    for _ in range(iters):
+        res = y - beta[0] * x - beta[1] * r
+        s = max(1.4826 * np.median(np.abs(res - np.median(res))), 1e-6)
+        u = np.abs(res) / (k * s)
+        w = np.where(u <= 1.0, 1.0, 1.0 / np.maximum(u, 1e-12))
+        f = 1.0 / (tau * s * s)
+        wx = w * x
+        N = f * np.array([[np.sum(wx * x), np.sum(wx * r)], [np.sum(wx * r), np.sum(w * r * r)]])
+        N[1, 1] += 1.0 / sd ** 2
+        b = np.array([f * np.sum(wx * y), f * np.sum(w * r * y) + mu / sd ** 2])
+        nb = np.linalg.solve(N, b)
+        done = np.allclose(nb, beta, rtol=1e-7, atol=1e-10)
+        beta = nb
+        if done:
+            break
+    return beta, w, s, np.linalg.inv(N)
+
+
+if njit is not None:
+    @njit(cache=True, nogil=True)
+    def _boot_one(x_all, y_all, flat, starts, pick, k, iters):
+        n = 0
+        for g in pick:
+            n += starts[g + 1] - starts[g]
+        xb = np.empty(n)
+        yb = np.empty(n)
+        j = 0
+        for g in pick:
+            for q in range(starts[g], starts[g + 1]):
+                i = flat[q]
+                xb[j] = x_all[i]
+                yb[j] = y_all[i]
+                j += 1
+        return _huber1_nb(xb, yb, k, iters)[0]
+
+
+def _bootstrap(s: pd.DataFrame, fit_idx: np.ndarray, cfg: CdAConfig, joint: bool, crr_used: float, tau: float = 1.0):
+    """Moving-block bootstrap 95% CI of CdA (block length cfg.block_s, shortened for short selections so that
+    there are at least ~6 blocks). ``joint`` re-fits CdA+Crr with the Crr prior instead of fixing Crr."""
+    if cfg.bootstrap_n <= 0 or len(fit_idx) < 60:
         return (np.nan, np.nan)
+    span = int(fit_idx[-1] - fit_idx[0] + 1)
+    block = int(max(30, min(cfg.block_s, span // 6)))
     rng = np.random.default_rng(cfg.seed)
-    blocks = fit_idx // cfg.block_s
+    blocks = fit_idx // block
     ub = np.unique(blocks)
     groups = [fit_idx[blocks == b] for b in ub]
+    if len(groups) < 3:
+        return (np.nan, np.nan)
     x_all = s["x"].to_numpy()
     y_all = s["y0"].to_numpy() - crr_used * s["r"].to_numpy()
     r_all = s["r"].to_numpy()
+    y0_all = s["y0"].to_numpy()
+    picks = [rng.integers(0, len(groups), len(groups)) for _ in range(cfg.bootstrap_n)]
+    if not joint and njit is not None:
+        flat = np.concatenate(groups).astype(np.int64)
+        starts = np.concatenate([[0], np.cumsum([len(g) for g in groups])]).astype(np.int64)
+        xa, ya = np.ascontiguousarray(x_all, dtype=float), np.ascontiguousarray(y_all, dtype=float)
+        one = lambda pk: _boot_one(xa, ya, flat, starts, pk.astype(np.int64), float(cfg.huber_k), 15)
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as ex:  # kernel releases the GIL
+            est = np.asarray(list(ex.map(one, picks)))
+        return (float(np.nanpercentile(est, 2.5)), float(np.nanpercentile(est, 97.5)))
     est = []
-    for _ in range(cfg.bootstrap_n):
-        pick = rng.integers(0, len(groups), len(groups))
+    for pick in picks:
         idx = np.concatenate([groups[i] for i in pick])
         if joint:
-            beta, _, _ = _huber(np.column_stack([x_all[idx], r_all[idx]]), s["y0"].to_numpy()[idx], cfg.huber_k, iters=15)
+            beta, _, _, _ = _joint_prior(x_all[idx], r_all[idx], y0_all[idx], cfg.huber_k, cfg.crr_prior_mean,
+                                         cfg.crr_prior_sd, tau, iters=15)
         else:
             beta, _, _ = _huber(x_all[idx], y_all[idx], cfg.huber_k, iters=15)
         est.append(beta[0])
@@ -441,40 +603,119 @@ def _rolling_cda(s: pd.DataFrame, w: np.ndarray, valid: np.ndarray, crr: float, 
     return out
 
 
-def wind_scale_scan(result: CdAResult, scales: Sequence[float] | None = None) -> pd.DataFrame:
-    """Scan wind scale; report CdA, fit loss and head-vs-tail CdA difference (should be ~0 at the right scale)."""
-    cfg = result.cfg
-    s = result.series
-    scales = np.linspace(0.0, 1.5, 16) if scales is None else np.asarray(scales, float)
-    mask = (s["valid"] & s["selected"]).to_numpy()
-    v = s["speed"].to_numpy()
-    crr = result.crr
-    rows = []
+def _scaled_series(s: pd.DataFrame, sc: float, cfg: CdAConfig) -> pd.DataFrame:
+    """Copy of a prepared series with the wind re-applied at scale ``sc`` (headwind, airspeed, aero regressor and
+    the columns derived from them), so masks and fits can be recomputed for that scale."""
+    t = s.copy(deep=False)
+    hw = s["hw_raw"].to_numpy(float) * sc
+    v = s["speed"].to_numpy(float)
+    va = v + hw
+    x = 0.5 * s["rho"].to_numpy(float) * va * np.abs(va) * v
+    y = s["y0"].to_numpy(float) - cfg.crr * s["r"].to_numpy(float)
+    t["headwind"], t["v_air"], t["x"], t["y"], t["implied_aero"] = hw, va, x, y, y
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t["implied_cda"] = np.where(np.abs(x) > 1.0, y / x, np.nan)
+    return t
+
+
+def _valid_for(t: pd.DataFrame, cfg: CdAConfig) -> np.ndarray:
+    anym = np.zeros(len(t), bool)
+    for m in compute_masks(t, cfg).values():
+        anym |= m
+    return ~anym
+
+
+def _parabolic_min(xs: np.ndarray, ys: np.ndarray) -> float:
+    """Location of the minimum of ys(xs): grid argmin refined by a parabola through its neighbours."""
+    xs = np.asarray(xs, float)
+    ys = np.asarray(ys, float)
+    if not np.isfinite(ys).any():
+        return float("nan")
+    i = int(np.nanargmin(ys))
+    if 0 < i < len(xs) - 1 and np.isfinite(ys[i - 1]) and np.isfinite(ys[i + 1]):
+        d = ys[i - 1] - 2 * ys[i] + ys[i + 1]
+        if d > 0:
+            off = 0.5 * (ys[i - 1] - ys[i + 1]) / d
+            return float(xs[i] + np.clip(off, -1, 1) * (xs[i + 1] - xs[i]))
+    return float(xs[i])
+
+
+def _huber_loss(r: np.ndarray, delta: float) -> float:
+    a = np.abs(r)
+    return float(np.mean(np.where(a <= delta, 0.5 * r * r, delta * (a - 0.5 * delta))))
+
+
+def _scan_core(s: pd.DataFrame, cfg: CdAConfig, crr: float, scales: Sequence[float]) -> tuple[pd.DataFrame, dict]:
+    """Scan the wind scale. Every scale gets its OWN validity mask (the low-airspeed / braking masks depend on the
+    wind) and its own scaled head/tail split (``cda``, ``loss``, ``cda_head``, ``cda_tail`` columns). The optimum
+    is chosen from ``loss_common``: the Huber loss on the samples valid at EVERY scale with one fixed Huber
+    threshold, so all scales are compared on identical data. Per-third optima measure its stability.
+    """
+    scales = np.asarray(scales, float)
+    sel = s["selected"].to_numpy(bool)
+    y = s["y0"].to_numpy(float) - crr * s["r"].to_numpy(float)
+    hw_raw = s["hw_raw"].to_numpy(float)
+    xs, valids = [], []
     for sc in scales:
-        v_air = v + sc * s["hw_raw"].to_numpy()
-        x = 0.5 * s["rho"].to_numpy() * v_air * np.abs(v_air) * v
-        y = s["y0"].to_numpy() - crr * s["r"].to_numpy()
-        idx = np.flatnonzero(mask & np.isfinite(x))
-        beta, w, sc_res = _huber(x[idx], y[idx], cfg.huber_k)
-        r = y[idx] - beta[0] * x[idx]
-        loss = float(np.sum(np.where(np.abs(r) <= cfg.huber_k * sc_res, 0.5 * r ** 2,
-                                     cfg.huber_k * sc_res * (np.abs(r) - 0.5 * cfg.huber_k * sc_res))) / len(idx))
-        hw = sc * s["hw_raw"].to_numpy()[idx]
-        out = {"wind_scale": float(sc), "cda": float(beta[0]), "rms_w": float(np.sqrt(np.mean(r ** 2))), "loss": loss}
-        for nm, sub in (("cda_head", hw > 0.5), ("cda_tail", hw < -0.5)):
-            if sub.sum() >= 30:
-                b, _, _ = _huber(x[idx][sub], y[idx][sub], cfg.huber_k)
-                out[nm] = float(b[0])
-            else:
-                out[nm] = np.nan
+        t = _scaled_series(s, sc, cfg)
+        x = t["x"].to_numpy(float)
+        xs.append(x)
+        valids.append(_valid_for(t, cfg) & sel & np.isfinite(x) & np.isfinite(y))
+    cidx = np.flatnonzero(np.logical_and.reduce(valids))
+    k = cfg.huber_k
+    delta = np.nan
+    if len(cidx) >= 30:  # one fixed Huber threshold for all scales: from the median robust residual scale
+        delta = k * float(np.median([_huber(x[cidx], y[cidx], k)[2] for x in xs]))
+    thirds = np.array_split(cidx, 3) if len(cidx) >= 90 else []
+    rows = []
+    loss_c = []
+    loss_t = [[] for _ in thirds]
+    for sc, x, valid in zip(scales, xs, valids):
+        idx = np.flatnonzero(valid)
+        out = {"wind_scale": float(sc), "n_valid": int(len(idx))}
+        if len(idx) >= 30:
+            b, _, s_own = _huber(x[idx], y[idx], k)
+            r = y[idx] - b[0] * x[idx]
+            hw = sc * hw_raw[idx]
+            out.update(cda=float(b[0]), rms_w=float(np.sqrt(np.mean(r ** 2))), loss=_huber_loss(r, k * s_own))
+            for nm, sub in (("cda_head", hw > 0.5), ("cda_tail", hw < -0.5)):
+                out[nm] = float(_huber(x[idx][sub], y[idx][sub], k)[0][0]) if sub.sum() >= 30 else np.nan
+        else:
+            out.update(cda=np.nan, rms_w=np.nan, loss=np.nan, cda_head=np.nan, cda_tail=np.nan)
         out["head_minus_tail"] = out["cda_head"] - out["cda_tail"]
+        if len(cidx) >= 30:
+            b, _, _ = _huber(x[cidx], y[cidx], k)
+            loss_c.append(_huber_loss(y[cidx] - b[0] * x[cidx], delta))
+            for j, th in enumerate(thirds):
+                bt, _, _ = _huber(x[th], y[th], k)
+                loss_t[j].append(_huber_loss(y[th] - bt[0] * x[th], delta))
+        else:
+            loss_c.append(np.nan)
+        out["loss_common"] = loss_c[-1]
         rows.append(out)
-    return pd.DataFrame(rows)
+    table = pd.DataFrame(rows)
+    opt = _parabolic_min(scales, np.asarray(loss_c))
+    t_opt = [_parabolic_min(scales, np.asarray(l)) for l in loss_t]
+    info = {"scale": opt, "thirds": t_opt, "common_n": int(len(cidx)),
+            "at_edge": bool(np.isfinite(opt) and (opt <= scales[0] + 1e-9 or opt >= scales[-1] - 1e-9)),
+            "third_range": (float(np.nanmax(t_opt) - np.nanmin(t_opt)) if t_opt and np.isfinite(t_opt).any() else np.nan)}
+    return table, info
+
+
+def wind_scale_scan(result: CdAResult, scales: Sequence[float] | None = None) -> pd.DataFrame:
+    """Scan wind scale; report CdA, fit loss and head-vs-tail CdA difference (should be ~0 at the right scale).
+
+    Each scale uses its own validity mask and its own scaled head/tail split.
+    """
+    scales = WIND_SCAN_SCALES if scales is None else np.asarray(scales, float)
+    table, _ = _scan_core(result.series, result.cfg, result.crr, scales)
+    return table
 
 
 def best_wind_scale(scan: pd.DataFrame) -> dict:
-    """Best scale by minimum loss and by head/tail balance (zero crossing)."""
-    res = {"by_loss": float(scan.loc[scan["loss"].idxmin(), "wind_scale"]), "by_balance": np.nan}
+    """Best scale by minimum loss (common-sample loss when available) and by head/tail balance (zero crossing)."""
+    col = "loss_common" if "loss_common" in scan and scan["loss_common"].notna().any() else "loss"
+    res = {"by_loss": _parabolic_min(scan["wind_scale"].to_numpy(float), scan[col].to_numpy(float)), "by_balance": np.nan}
     d = scan.dropna(subset=["head_minus_tail"])
     if len(d) >= 2:
         sc, df_ = d["wind_scale"].to_numpy(), d["head_minus_tail"].to_numpy()
@@ -491,6 +732,19 @@ def analyse_ride(ride: Ride, cfg: CdAConfig | None = None, weather: Weather | No
                  laps: Sequence[int] | None = None, scan_wind: bool = False) -> CdAResult:
     cfg = cfg or CdAConfig()
     s, warn, meta = _prepare(ride, cfg, weather, laps)
+    scan_tab, scan_info = None, None
+    if meta["wind_mode_used"] == "weather":
+        # scan 0..1.2 (own mask per scale); in "auto" mode adopt the loss-minimising scale
+        scan_tab, scan_info = _scan_core(s, cfg, cfg.crr, WIND_SCAN_SCALES)
+        if isinstance(cfg.wind_scale, str):
+            sc = scan_info["scale"]
+            if not np.isfinite(sc):
+                sc = 0.5
+                warn.append("Automatic wind scale failed (too little valid data); using 0.5.")
+            s = _scaled_series(s, float(sc), cfg)
+            meta["wind_scale_used"] = float(sc)
+            if scan_info["at_edge"]:
+                warn.append(f"Automatic wind scale ended at the edge of the scan ({sc:.2f}); the wind data may not match this ride.")
     masks = compute_masks(s, cfg)
     any_mask = np.zeros(len(s), bool)
     for k in REASONS:
@@ -510,20 +764,28 @@ def analyse_ride(ride: Ride, cfg: CdAConfig | None = None, weather: Weather | No
         )
     beta_f, w_f, _ = _solve(s, fit_idx, cfg)
     cda_fixed = float(beta_f[0])
-    joint = None
     cda, crr = cda_fixed, cfg.crr
-    beta_j, w_j, sc_j = _solve(s, fit_idx, cfg, joint=True)
-    X = np.column_stack([s["x"].to_numpy()[fit_idx], s["r"].to_numpy()[fit_idx]])
-    Xn = X / np.linalg.norm(X, axis=0)
-    cond = float(np.linalg.cond(Xn))
+    xv, rv, y0v = s["x"].to_numpy(), s["r"].to_numpy(), s["y0"].to_numpy()
+    # residual autocorrelation time of the fixed-Crr fit: 1 Hz samples are far from independent
+    e_full = np.full(len(s), np.nan)
+    e_full[fit_idx] = y0v[fit_idx] - cfg.crr * rv[fit_idx] - cda_fixed * xv[fit_idx]
+    tau = _autocorr_tau(e_full)
+    beta_j, w_j, sc_j, cov_j = _joint_prior(xv[fit_idx], rv[fit_idx], y0v[fit_idx], cfg.huber_k,
+                                            cfg.crr_prior_mean, cfg.crr_prior_sd, tau)
+    X = np.column_stack([xv[fit_idx], rv[fit_idx]])
+    cond = float(np.linalg.cond(X / np.linalg.norm(X, axis=0)))
     corr = float(np.corrcoef(X[:, 0], X[:, 1])[0, 1])
-    joint = {"cda": float(beta_j[0]), "crr": float(beta_j[1]), "cond": cond, "corr": corr,
-             "ill_conditioned": bool(cond > 20 or corr > 0.95 or not (0.001 <= beta_j[1] <= 0.012))}
+    crr_sd = float(np.sqrt(cov_j[1, 1]))
+    joint = {"cda": float(beta_j[0]), "crr": float(beta_j[1]), "cda_sd": float(np.sqrt(cov_j[0, 0])), "crr_sd": crr_sd,
+             "prior_mean": cfg.crr_prior_mean, "prior_sd": cfg.crr_prior_sd, "tau": tau, "cond": cond, "corr": corr,
+             # data barely informs Crr: the estimate is mostly the prior (CdA and Crr are strongly correlated)
+             "ill_conditioned": bool(cond > 20 or corr > 0.95 or crr_sd > 0.7 * cfg.crr_prior_sd)}
     if cfg.fit_crr:
         if joint["ill_conditioned"]:
             warn.append(
-                f"Joint CdA/Crr fit is poorly conditioned (cond={cond:.0f}, corr={corr:.2f}, "
-                f"Crr={beta_j[1]:.4f}); CdA and Crr trade off. Prefer a fixed Crr unless speed varies a lot."
+                f"Joint CdA/Crr fit is prior-dominated (cond={cond:.0f}, corr={corr:.2f}, posterior Crr sd "
+                f"{crr_sd:.4f} vs prior sd {cfg.crr_prior_sd:.4f}): the data barely inform Crr, so CdA and Crr trade off. "
+                "Prefer a fixed Crr unless speed varies a lot."
             )
         cda, crr = float(beta_j[0]), float(beta_j[1])
         w_use = w_j
@@ -533,7 +795,7 @@ def analyse_ride(ride: Ride, cfg: CdAConfig | None = None, weather: Weather | No
     w_full[fit_idx] = w_use
     resid = s["y0"].to_numpy()[fit_idx] - crr * s["r"].to_numpy()[fit_idx] - cda * s["x"].to_numpy()[fit_idx]
     rms = float(np.sqrt(np.mean(resid ** 2)))
-    ci = _bootstrap(s, fit_idx, cfg, cfg.fit_crr, crr)
+    ci = _bootstrap(s, fit_idx, cfg, cfg.fit_crr, crr, tau)
 
     s["robust_w"] = w_full
     s["fit_resid"] = np.where(valid, s["y0"] - crr * s["r"] - cda * s["x"], np.nan)
@@ -572,17 +834,76 @@ def analyse_ride(ride: Ride, cfg: CdAConfig | None = None, weather: Weather | No
         })
     laps_df = pd.DataFrame(lap_rows)
 
-    if meta.get("wind_source") == "none" and cfg.wind_mode != "none":
-        pass
+    gap = (wind_split["cda"].iloc[0] - wind_split["cda"].iloc[2]) if len(wind_split) == 3 else np.nan
+    meta["head_minus_tail"] = float(gap)
+    meta["tau_s"] = tau
+    meta["ci_block_s"] = int(max(30, min(cfg.block_s, int(fit_idx[-1] - fit_idx[0] + 1) // 6)))
+    # ---- sensitivities and systematic range (CdA moves with Crr, wind scale and drivetrain efficiency)
+    fixed = lambda c, dy=0.0: float(_huber(xv[fit_idx], y0v[fit_idx] + dy - c * rv[fit_idx], cfg.huber_k)[0][0])
+    d_up, d_dn = fixed(crr + CRR_STEP) - fixed(crr), fixed(crr - CRR_STEP) - fixed(crr)
+    crr_half = 0.5 * abs(d_up - d_dn)
+    pw = s["power"].to_numpy()[fit_idx]
+    base_y = y0v[fit_idx] - crr * rv[fit_idx]
+    cda_e = [float(_huber(xv[fit_idx], base_y + pw * (cfg.drivetrain_eff * f - cfg.drivetrain_eff), cfg.huber_k)[0][0])
+             for f in (1 - EFF_REL, 1 + EFF_REL)]
+    eff_half = 0.5 * abs(cda_e[1] - cda_e[0])
+    wind_half, wind_list = 0.0, []
+    if scan_tab is not None and scan_info["thirds"]:
+        grid, cda_grid = scan_tab["wind_scale"].to_numpy(), scan_tab["cda"].to_numpy()
+        okg = np.isfinite(cda_grid)
+        if okg.sum() >= 2:
+            ref = float(np.interp(meta["wind_scale_used"], grid[okg], cda_grid[okg]))
+            wind_list = [float(np.interp(t, grid[okg], cda_grid[okg])) - ref for t in scan_info["thirds"] if np.isfinite(t)]
+            wind_half = max([abs(d) for d in wind_list], default=0.0)
+    half = float(np.sqrt(crr_half ** 2 + eff_half ** 2 + wind_half ** 2))
+    sys_range = {"crr_half": float(crr_half), "wind_half": float(wind_half), "eff_half": float(eff_half), "half": half,
+                 "lo": cda - half, "hi": cda + half, "crr_step": CRR_STEP, "eff_rel": EFF_REL,
+                 "note": "Components added in quadrature. Excludes power-meter bias (a 2% error is ~2% in CdA), mass and wind-model error."}
+    wind_auto = None
+    if scan_info is not None:
+        wind_auto = {"auto": isinstance(cfg.wind_scale, str), "used": float(meta["wind_scale_used"]),
+                     "optimum": float(scan_info["scale"]), "thirds": [float(t) for t in scan_info["thirds"]],
+                     "third_range": float(scan_info["third_range"]), "common_n": scan_info["common_n"],
+                     "head_minus_tail": float(gap), "at_edge": scan_info["at_edge"]}
     res = CdAResult(
         cda=cda, cda_ci=ci, crr=crr, cda_fixed_crr=cda_fixed, joint=joint, n_valid=len(fit_idx), n_selected=n_sel,
         resid_rms_w=rms, series=s, mask_report=report, laps=laps_df, wind_split=wind_split, speed_split=speed_split,
         energy=_energy(s, fm, cda, crr, cfg), energy_selection=_energy(s, sel & np.isfinite(s["x"].to_numpy()), cda, crr, cfg),
-        cfg=cfg, meta=meta, warnings=warn,
+        cfg=cfg, meta=meta, warnings=warn, wind_scan=scan_tab, wind_auto=wind_auto, crr_sensitivity=float(d_up),
+        sys_range=sys_range,
     )
-    if scan_wind and meta.get("wind_source") not in ("none", None):
-        res.wind_scan = wind_scale_scan(res)
+    res.confidence = assess_confidence(res)
     return res
+
+
+def assess_confidence(res: CdAResult) -> dict:
+    """High / Medium / Low from: head-minus-tail CdA gap at the chosen wind scale, stability of the wind-scale
+    optimum across thirds of the ride, % valid data and the systematic range. Returns {"level", "items"}."""
+    items = []
+
+    def add(name, value, text, grade):  # grade: 2 good, 1 ok, 0 bad, None = not applicable
+        items.append({"name": name, "value": value, "text": text, "grade": grade})
+
+    wa, sr = res.wind_auto, res.sys_range or {}
+    if wa is not None:
+        g = abs(wa["head_minus_tail"])
+        add("Head/tail gap", g, f"{wa['head_minus_tail']:+.3f} m² at wind scale {wa['used']:.2f}",
+            None if not np.isfinite(g) else 2 if g <= 0.015 else 1 if g <= 0.03 else 0)
+        tr, wh = wa["third_range"], sr.get("wind_half", 0.0)
+        # an unstable optimum only matters if CdA is sensitive to the wind scale
+        grade = None if not np.isfinite(tr) else 2 if (tr <= 0.2 or wh <= 0.004) else 1 if tr <= 0.4 else 0
+        add("Wind-scale stability", tr, f"optimum varies by {tr:.2f} across thirds of the ride (CdA effect ±{wh:.3f})", grade)
+    else:
+        add("Wind", None, "no weather wind applied; head/tail check not available", None)
+    vp = res.valid_pct
+    add("Valid data", vp, f"{vp:.0f}% of the selection", 2 if vp >= 60 else 1 if vp >= 35 else 0)
+    half = sr.get("half", np.nan)
+    add("Systematic range", half, f"±{half:.3f} m² (Crr ±{CRR_STEP:.3f}, wind scale, efficiency ±{EFF_REL * 100:.1f}%)",
+        None if not np.isfinite(half) else 2 if half <= 0.012 else 1 if half <= 0.025 else 0)
+    g = [i["grade"] for i in items if i["grade"] is not None]
+    bad, ok = g.count(0), g.count(1)
+    level = "Low" if bad >= 2 else "Medium" if (bad == 1 or ok >= 3) else "High"
+    return {"level": level, "items": items}
 
 
 # ----------------------------------------------------------------------------- virtual elevation
@@ -599,8 +920,15 @@ def virtual_elevation(series: pd.DataFrame, cda: float, crr: float, cfg: CdAConf
     v = sub["speed"].to_numpy(float)
     f_aero_v = 0.5 * sub["rho"].to_numpy(float) * cda * sub["v_air"].to_numpy(float) * np.abs(sub["v_air"].to_numpy(float)) * v
     dh = (sub["p_wheel"].to_numpy(float) - crr * m * G * v - f_aero_v - m_eff * v * sub["accel"].to_numpy(float)) / (m * G)
-    dh = np.nan_to_num(dh)  # dt = 1 s
     alt = sub["alt"].to_numpy(float)
+    # Rows the CdA fit excludes (coasting, braking, corners, stops, gaps...) or that cannot be modelled carry no
+    # information about CdA: there the virtual elevation follows the actual altitude change instead of integrating
+    # a physically wrong power balance, and it does so identically for every CdA (so VE stays linear in CdA).
+    bad = ~np.isfinite(dh)
+    if "valid" in sub:
+        bad |= ~sub["valid"].to_numpy(bool)
+    dalt = np.nan_to_num(np.diff(alt, prepend=alt[0]))
+    dh = np.where(bad, dalt, dh)  # dt = 1 s
     ve = alt[0] + np.cumsum(dh)
     return pd.DataFrame({"t_s": sub["t_s"].to_numpy(), "dist_km": sub["dist_km"].to_numpy(), "ve": ve, "alt": alt}, index=sub.index)
 
