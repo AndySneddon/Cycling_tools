@@ -124,14 +124,16 @@ def test_2x_recovers_56_42_usage():
     st = g.parse_setup("56/42")
     mat = g.usage_matrix_setup(speed, cad, None, st, CAS, 2.13)
     share56 = mat.loc[56].sum() / mat.to_numpy().sum()
-    assert 0.35 < share56 < 0.75  # ~half the ride on each ring (overlap lets some samples go either way)
+    assert 0.35 < share56 < 0.8  # ~half the ride on each ring (overlap lets some samples go either way)
     assert mat.to_numpy().sum() > 99
     res = g.evaluate_setups(speed, cad, None, [g.Setup((56,)), st, g.Setup((42,))], CAS, 2.13)
     r = res.set_index("setup")
     assert r.loc["56/42", "out_of_range_pct"] < 1
     assert r.loc["56/42", "mid4_pct"] > r.loc["56", "mid4_pct"] + 10  # 1x56 pushes the climbs to the cassette end
     assert r.loc["42", "out_of_range_pct"] > 5  # 1x42 spins out on the fast half
-    assert r.loc["56/42", "front_shifts_per_hour"] > 0
+    # (with the small-ring bias the 42 is only used for the real climbs, so brief excursions are debounced away)
+    shifty = g.evaluate_setups(speed, cad, None, [st], CAS, 2.13, weights={"min_dwell_s": 1})
+    assert shifty.front_shifts_per_hour.iloc[0] > 0
     assert r.loc["56/42", "aero_penalty_w"] > 0
     assert r.loc["56/42", "gear_range_pct"] > r.loc["56", "gear_range_pct"]
     free = g.evaluate_setups(speed, cad, None, [st], CAS, 2.13, weights={"aero_delta_cda": 0})
@@ -179,3 +181,99 @@ def test_streamlit_page_smoke():
     assert any("Recommended" in x.value for x in at.success)
     at.radio[0].set_value("2x only").run()
     assert not at.exception, [e.value for e in at.exception]
+
+
+# ------------------------------------------------------------------ audit regressions
+def _fake_ride(n=600, no_power_lap2=True, name="fake.fit"):
+    import pandas as pd
+    from types import SimpleNamespace
+    rng = np.random.default_rng(3)
+    lap = np.where(np.arange(n) < n // 2, 1, 2)
+    power = rng.normal(200, 20, n)
+    if no_power_lap2:
+        power[lap == 2] = np.nan
+    df = pd.DataFrame({"speed": rng.normal(9, .3, n), "cadence": rng.normal(90, 3, n), "power": power,
+                       "dist": np.cumsum(np.full(n, 9.0)), "gap": False, "lap": lap})
+    return SimpleNamespace(name=name, df=df)
+
+
+def test_no_power_laps_reported_and_excluded():
+    r = _fake_ride()
+    df = g.prepare_gearing_samples([r], min_power=0)  # NaN >= 0 is False: used to drop silently
+    assert len(df) == 300 and df.attrs["no_power_laps"] == [(r.name, 2, 300)]
+    # a lap deselected by the user is not reported
+    assert g.prepare_gearing_samples([r], laps={r.name: [1]}).attrs["no_power_laps"] == []
+    # a ride with no power at all: zero samples, but reported
+    r0 = _fake_ride(no_power_lap2=False)
+    r0.df["power"] = np.nan
+    d0 = g.prepare_gearing_samples([r0], min_power=0)
+    assert len(d0) == 0 and len(d0.attrs["no_power_laps"]) == 2
+    # opting in keeps the power-less samples (also through the power filters)
+    d1 = g.prepare_gearing_samples([r], min_power=50, power_range=(0, 400), require_power=False)
+    assert len(d1) == 600 and d1.attrs["no_power_laps"] == []
+    assert len(g.fit_cadence_model(d1)) and g.fit_cadence_model(d1)["n"] == 300
+
+
+def test_segments_split_at_gaps():
+    r = _fake_ride(no_power_lap2=False)
+    r.df.loc[200:260, "gap"] = True  # 61 s hole
+    df = g.prepare_gearing_samples([r])
+    assert df["seg"].nunique() == 2
+
+
+def test_front_shifts_not_counted_across_segments():
+    ring = np.array([0] * 30 + [1] * 30)
+    w = np.ones(60)
+    assert g.count_front_shifts_segments(ring, w, np.zeros(60, int), 10) == 1
+    assert g.count_front_shifts_segments(ring, w, np.r_[np.zeros(30, int), np.ones(30, int)], 10) == 0
+    assert g.count_front_shifts_segments(ring, w, None, 10) == 1
+
+
+def test_small_ring_bias_stops_flicker():
+    rng = np.random.default_rng(0)
+    n = 7200
+    speed = np.convolve(10.0 + rng.normal(0, .15, n), np.ones(5) / 5, "same")  # hovers at a ring-change tie
+    cad = np.full(n, 90.0)
+    w, s2 = np.ones(n), [g.parse_setup("56/42")]
+    old = g.evaluate_setups(speed, cad, w, s2, CAS, 2.13, {"small_ring_bias": 0.015, "min_dwell_s": 1})
+    new = g.evaluate_setups(speed, cad, w, s2, CAS, 2.13, {"min_dwell_s": 1})
+    assert g.DEFAULT_SETUP_WEIGHTS["small_ring_bias"] >= 0.05
+    assert new.front_shifts_per_hour[0] < 0.1 * old.front_shifts_per_hour[0]
+    assert old.front_shifts_per_hour[0] > 100  # the flicker being fixed (bias 0.015)
+
+
+def test_ranking_bars_are_disjoint_and_sum_to_100():
+    from cycling_tools import viz_gearing as vz
+    speed, cad, _ = _mixed_ride()
+    res = g.evaluate_setups(speed, cad, None, g.default_setups("2x"), CAS, 2.13)
+    assert (res.ends_only_pct <= res.ends_pct + 1e-9).all()
+    assert (res.ends_pct - res.ends_only_pct).max() > 0.01  # cross-chained time sits inside ends_pct
+    fig = vz.ranking_fig(res)
+    bars = [np.asarray(t.y, float) for t in fig.data if t.type == "bar"]
+    assert np.allclose(np.sum(bars, axis=0), 100.0)
+
+
+def test_mid_bands_centred_for_odd_cassettes():
+    for n in (11, 9, 13):
+        b2, b4, be = g._band_weights(n)
+        assert b4.sum() == pytest.approx(4) and b2.sum() == pytest.approx(2)
+        assert np.allclose(b4, b4[::-1]) and np.allclose(b2, b2[::-1]) and np.allclose(be, be[::-1])
+    b2, b4, be = g._band_weights(12)  # even: whole sprockets, unchanged
+    assert list(np.flatnonzero(b4)) == [4, 5, 6, 7] and list(np.flatnonzero(b2)) == [5, 6]
+    # an 11-speed ride centred on the middle sprocket scores the same either side of the cassette
+    c11 = g.CASSETTES["11-28 (11sp)"]
+    a = g.evaluate_chainrings(np.array([10.0] * 50), np.full(50, 90.0), None, [50], c11, 2.13)
+    assert a.mid4_pct[0] in (0.0, 50.0, 100.0)  # band edges give half weight, not 'whole sprocket in/out' flips
+
+
+def test_recommend_plateau_and_edge():
+    import pandas as pd
+    ranked = pd.DataFrame({"setup": ["66", "64", "62", "60", "56/42"], "n_rings": [1, 1, 1, 1, 2],
+                           "big_ring": [66, 64, 62, 60, 56],
+                           "score": [95.8, 95.7, 95.7, 88.0, 60.0]})
+    rec = g.recommend(ranked)
+    assert rec["best"].setup == "66" and rec["pick"].setup == "62" and rec["near"] == ["62", "64", "66"]
+    assert rec["edge"] == "high" and rec["edge_ring"] == 66
+    ranked2 = ranked.assign(score=[70, 80, 90, 80, 60]).sort_values("score", ascending=False)
+    rec2 = g.recommend(ranked2)
+    assert rec2["pick"].setup == "62" and rec2["edge"] is None and rec2["near"] == ["62"]

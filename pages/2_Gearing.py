@@ -32,6 +32,13 @@ def _load(key: str, data: bytes | None):
     return load_fit(FIT_DIR / key) if data is None else load_fit(data, name=key)
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
+def _evaluate(df, setups, cassette, circ, wts):
+    res = g.evaluate_setups(df["speed"], df["cadence"], df["weight_s"], setups, cassette, circ, wts,
+                            segments=df["seg"] if "seg" in df else None)
+    return res.sort_values("score", ascending=False).reset_index(drop=True), g.fit_cadence_model(df)
+
+
 with st.sidebar:
     st.header("Rides")
     avail = sorted(p.name for p in FIT_DIR.glob("*") if p.suffix.lower() == ".fit")
@@ -94,6 +101,10 @@ with st.sidebar:
     min_power = st.slider("Min power (W)", 0, 300, 50)
     pr = st.slider("Power range (W)", 0, 1000, (0, 1000))
     min_cad = st.slider("Min cadence (rpm)", 0, 90, 40)
+    incl_nopower = st.checkbox("Include laps without power data", value=False,
+                               help="Laps (e.g. the swim/run legs of a multisport file) with no power readings are "
+                                    "excluded by default. Tick to keep them; the power plots and cadence model then "
+                                    "ignore their samples.")
 
 try:
     cassette = g.parse_cassette(cas_txt)
@@ -111,11 +122,21 @@ with st.expander("Score weights"):
     w_cross = st.slider("Penalty per % time cross-chained", 0.0, 2.0, g.DEFAULT_SETUP_WEIGHTS["w_cross"], 0.05)
     w_shift = st.slider("Penalty per front shift per hour", 0.0, 0.5, g.DEFAULT_SETUP_WEIGHTS["w_shift"], 0.01)
     n_cross = st.slider("Sprockets counted as cross-chained at each end", 0, 5, g.DEFAULT_SETUP_WEIGHTS["n_cross"])
+    min_dwell = st.slider("Front shifts shorter than this are flicker (s)", 1, 60,
+                          int(g.DEFAULT_SETUP_WEIGHTS["min_dwell_s"]),
+                          help="A ring change is only counted if the new ring is held for at least this long, "
+                               "within one continuous stretch of riding. Shifts/h is very sensitive to this.")
 wts = {"w_ends": w_ends, "w_oor": w_oor, "aero_delta_cda": d_cda, "w_aero": w_aero, "w_cross": w_cross,
-       "w_shift": w_shift, "n_cross": n_cross}
+       "w_shift": w_shift, "n_cross": n_cross, "min_dwell_s": float(min_dwell)}
 
 df = g.prepare_gearing_samples(rides, min_power=min_power, min_cadence=min_cad, laps=laps, terrain=terrain,
-                               power_range=(pr[0], None if pr[1] >= 1000 else pr[1]))
+                               power_range=(pr[0], None if pr[1] >= 1000 else pr[1]),
+                               require_power=not incl_nopower)
+nop = df.attrs.get("no_power_laps", [])
+if nop:
+    st.info("Excluded laps without power data: " + "; ".join(f"{n} lap {lap} ({cnt/60:.0f} min of pedalling)" if cnt >= 120 else f"{n} lap {lap} ({cnt} s)"
+                                                               for n, lap, cnt in nop)
+            + ". Tick 'Include laps without power data' in the sidebar to use them anyway.")
 if len(df) < 60:
     st.warning("Too few pedalling samples with these filters.")
     st.stop()
@@ -123,15 +144,25 @@ if not setups:
     st.warning("Choose at least one chainring setup.")
     st.stop()
 
-res = g.evaluate_setups(df["speed"], df["cadence"], df["weight_s"], setups, cassette, circ, wts)
-ranked = res.sort_values("score", ascending=False).reset_index(drop=True)
-best = ranked.iloc[0]
-cm = g.fit_cadence_model(df)
+ranked, cm = _evaluate(df, setups, cassette, circ, wts)
+rec = g.recommend(ranked, tol=1.0)
+best, pick = rec["best"], rec["pick"]
 
-st.success(f"Recommended: **{best.setup}** with {cassette[0]}-{cassette[-1]} "
-           f"(score {best.score:.1f}; {best.mid4_pct:.0f}% in middle 4, {best.ends_pct:.0f}% on outer ends, "
-           f"{best.out_of_range_pct:.1f}% out of range, {best.cross_chain_pct:.1f}% cross-chained). "
+st.success(f"Recommended: **{pick.setup}** with {cassette[0]}-{cassette[-1]} "
+           f"(score {pick.score:.1f}; {pick.mid4_pct:.0f}% in middle 4, {pick.ends_pct:.0f}% on outer ends, "
+           f"{pick.out_of_range_pct:.1f}% out of range, {pick.cross_chain_pct:.1f}% cross-chained). "
            f"Based on {len(df)/3600:.1f} h of pedalling.")
+if len(rec["near"]) > 1:
+    kind = "1x rings" if best.n_rings == 1 else "2x setups"
+    msg = (f"**Plateau:** {len(rec['near'])} {kind} score within {rec['tol']:.0f} point of the best "
+           f"({best.setup}, {best.score:.1f}): {', '.join(rec['near'])}. Differences this small are within what a 1% "
+           f"change in tyre circumference or a different ride would flip, so the smallest of them "
+           f"({pick.setup}) is the pick.")
+    st.info(msg)
+if rec["edge"]:
+    side = "top" if rec["edge"] == "high" else "bottom"
+    st.warning(f"The best scores reach the {side} edge of the 1x range searched ({rec['edge_ring']}T): the optimum "
+               f"may be beyond it - widen the range in the sidebar.")
 one, two = ranked[ranked.n_rings == 1], ranked[ranked.n_rings == 2]
 if len(one) and len(two):
     b1, b2 = one.iloc[0], two.iloc[0]
@@ -157,7 +188,7 @@ if ones:
                                                   [x.chainrings[0] for x in ones], cassette, circ)),
                     use_container_width=True)
 labels = [x.label for x in setups]
-sel = st.selectbox("Setup to inspect", labels, index=labels.index(best.setup))
+sel = st.selectbox("Setup to inspect", labels, index=labels.index(pick.setup))
 chosen_setup = setups[labels.index(sel)]
 if chosen_setup.is_2x:
     st.caption("Gear usage per ring/sprocket combo (dotted red = cross-chained)")
@@ -174,7 +205,7 @@ st.subheader("Power by gear")
 st.plotly_chart(vz.power_by_gear_fig(df, chosen_setup, cassette, circ, wts), use_container_width=True)
 
 if st.button("Save setup / cassette / cadence model to rider profile"):
-    bs = setups[labels.index(best.setup)]
+    bs = setups[labels.index(pick.setup)]
     profile.chainring = int(max(bs.chainrings))
     profile.cassette = cassette
     profile.tyre_circumference_m = float(circ)

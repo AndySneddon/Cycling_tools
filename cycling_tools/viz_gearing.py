@@ -23,11 +23,14 @@ def ranking_fig(res: pd.DataFrame) -> go.Figure:
     else:
         r = r.sort_values("chainring")
         label = r["chainring"].astype(str)
-    other = (100 - r["mid4_pct"] - r["ends_pct"] - r["out_of_range_pct"]
+    # ends_pct (used by the score) includes cross-chained time on 2x; the bars use the disjoint 'ends_only_pct'
+    # so that the stack really is mid4 + other + ends + cross-chained + out of range = 100
+    ends = r["ends_only_pct"] if "ends_only_pct" in r else r["ends_pct"]
+    other = (100 - r["mid4_pct"] - ends - r["out_of_range_pct"]
              - (r["cross_chain_pct"] if "cross_chain_pct" in r else 0)).clip(lower=0)
     fig = go.Figure()
     bars = [("Middle 4 sprockets", r["mid4_pct"], "#2a9d8f"), ("Other sprockets", other, "#b8c4cc"),
-            ("Outer 2 each end", r["ends_pct"], "#e9c46a")]
+            ("Outer 2 each end", ends, "#e9c46a")]
     if "cross_chain_pct" in r:
         bars.append(("Cross-chained", r["cross_chain_pct"], "#9b5de5"))
     bars.append(("Out of range", r["out_of_range_pct"], "#e76f51"))
@@ -61,8 +64,11 @@ def heatmap_fig(mat: pd.DataFrame, setup: Setup | None = None, n_cross: int = 3)
 
 def speed_cadence_fig(df: pd.DataFrame, setup, cassette: list[int], circ: float = DEFAULT_CIRCUMFERENCE_M) -> go.Figure:
     setup = _as_setup(setup)
-    fig = go.Figure(go.Histogram2d(x=df["speed"] * 3.6, y=df["cadence"], nbinsx=60, nbinsy=50,
-                                   colorscale="Blues", colorbar=dict(title="samples")))
+    # Bin on the server: shipping 44k raw (x, y) points to the browser for a Histogram2d is ~1 MB of JSON
+    z, xe, ye = np.histogram2d(df["speed"].to_numpy() * 3.6, df["cadence"].to_numpy(), bins=(60, 50))
+    z = np.where(z > 0, z, np.nan)  # empty cells transparent, as Histogram2d draws them
+    fig = go.Figure(go.Heatmap(z=z.T, x=0.5 * (xe[:-1] + xe[1:]), y=0.5 * (ye[:-1] + ye[1:]), colorscale="Blues",
+                               colorbar=dict(title="samples"), hovertemplate="%{x:.1f} km/h, %{y:.0f} rpm: %{z:.0f}<extra></extra>"))
     v = np.linspace(max(df["speed"].min(), 1) * 3.6, df["speed"].max() * 3.6, 50)
     cols = ["rgba(231,111,81,0.8)", "rgba(155,93,229,0.7)"]
     for k, ring in enumerate(setup.chainrings):
@@ -80,9 +86,14 @@ def cadence_hist_fig(df: pd.DataFrame, setup, cassette: list[int], circ: float =
     setup = _as_setup(setup)
     a = _assign_gears(df["speed"].to_numpy(), df["cadence"].to_numpy(), setup, cassette, circ, _setup_weights(weights))
     fig = go.Figure()
-    fig.add_histogram(x=df["cadence"], name="Observed", xbins=dict(size=2), opacity=0.6, marker_color="#264653")
-    fig.add_histogram(x=a["cadence"][~a["oor"]], name=f"Achieved with {setup.label}", xbins=dict(size=2),
-                      opacity=0.6, marker_color="#e9c46a")
+    obs, ach = df["cadence"].to_numpy(float), a["cadence"][~a["oor"]]
+    lo = 2.0 * np.floor(min(np.nanmin(obs), np.nanmin(ach)) / 2.0)
+    hi = np.nanmax([np.nanmax(obs), np.nanmax(ach)])
+    edges = np.arange(lo, hi + 2.0, 2.0)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    for vals, name, col in ((obs, "Observed", "#264653"), (ach, f"Achieved with {setup.label}", "#e9c46a")):
+        fig.add_bar(x=centres, y=np.histogram(vals[np.isfinite(vals)], bins=edges)[0], name=name, width=2.0,
+                    opacity=0.6, marker_color=col)
     fig.update_layout(barmode="overlay", xaxis_title="Cadence (rpm)", yaxis_title="Samples (s)",
                       height=380, margin=dict(t=30), legend=dict(orientation="h", y=-0.25))
     return fig
@@ -95,12 +106,23 @@ def power_by_gear_fig(df: pd.DataFrame, setup, cassette: list[int], circ: float 
     a = _assign_gears(df["speed"].to_numpy(), df["cadence"].to_numpy(), setup, cas, circ, _setup_weights(weights))
     ring = np.asarray(setup.chainrings)[a["ring_idx"]]
     d = pd.DataFrame({"ring": ring, "spr": cas[a["sprocket_idx"]], "power": df["power"].to_numpy()})[~a["oor"]]
+    d = d.dropna(subset=["power"])
     d["ratio"] = d["ring"] / d["spr"]
     d["gear"] = d["ring"].astype(str) + "x" + d["spr"].astype(str)
     order = d.groupby("gear")["ratio"].first().sort_values().index
     fig = go.Figure()
+    # Box statistics on the server (plotly's default 'linear' quartiles, 1.5 IQR whiskers) instead of sending
+    # every sample to the browser
+    stats = {}
+    for gname, grp in d.groupby("gear")["power"]:
+        v = grp.to_numpy(float)
+        q1, med, q3 = np.percentile(v, [25, 50, 75])
+        iqr = q3 - q1
+        stats[gname] = (q1, med, q3, v[v >= q1 - 1.5 * iqr].min(), v[v <= q3 + 1.5 * iqr].max(), v.mean(), v.std(ddof=1) if len(v) > 1 else 0.0)
     for gname in order:
-        fig.add_box(y=d.loc[d["gear"] == gname, "power"], name=gname, boxpoints=False, marker_color="#2a9d8f")
+        q1, med, q3, lf, uf, mu, sd = stats[gname]
+        fig.add_box(x=[gname], q1=[q1], median=[med], q3=[q3], lowerfence=[lf], upperfence=[uf], name=gname,
+                    boxpoints=False, marker_color="#2a9d8f")
     fig.update_layout(xaxis_title=f"Gear ({setup.label}), easy to hard", yaxis_title="Power (W)", height=380,
                       showlegend=False, margin=dict(t=30))
     return fig
