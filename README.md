@@ -32,6 +32,10 @@ Run the tests (about 30 s; a few use the network for weather and skip if it is u
 3. **Gearing**: choose rides, cassette and 1x/2x candidates. Save your preferred setup and cadence model.
 4. **Race Planner**: load a GPX, enter your target NP and an expected variability index (VI), choose the weather
    source, and read off the predicted time, chainring and pacing plan.
+5. **Saved races**: once a course is loaded, name the plan in the *Save this race plan* box. Everything is stored
+   (course, rider values, NP and VI, weather, setups and optimiser settings) and can be reloaded, updated or deleted
+   from *Saved races* in the sidebar. Plans live in `race_profiles/`, which is git-ignored because courses contain
+   real locations.
 
 Weather comes from [Open-Meteo](https://open-meteo.com) (free, no key): the reanalysis archive for past dates and the
 forecast for the next ~16 days. Responses are cached in `.cache/` (forecasts expire after 2 h).
@@ -92,6 +96,7 @@ cycling_tools/         shared engine
   gearing.py viz_gearing.py    Tool 2
   course.py simulate.py optimise.py viz_race.py    Tool 3
   profile.py branding.py       rider profile, logo and styling
+  race_profiles.py             named, saved race plans
 assets/                logo files
 courses/               GPX courses
 tests/                 pytest suite

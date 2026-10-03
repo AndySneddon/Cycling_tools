@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from cycling_tools import race_profiles as rp
 from cycling_tools import viz_race
 from cycling_tools.course import CourseSettings, load_gpx
 from cycling_tools.optimise import optimise_pacing
@@ -39,6 +40,46 @@ page_header("Race Planner",
             eyebrow="Tool 3 · Race strategy")
 
 COURSES_DIR = ROOT / "courses"
+
+# ------------------------------------------------------------ saved race plans
+# Loading a race bumps a token that is part of every widget key, so each input is rebuilt with the saved value as its
+# default (and then stays freely editable). D() reads a saved value, falling back to the usual default.
+T = st.session_state.get("rp_token", 0)
+LOADED = st.session_state.get("rp_loaded", {})
+
+
+def D(key, default):
+    return LOADED.get(key, default)
+
+
+def _load_race(slug: str) -> None:
+    try:
+        profile, gpx = rp.load_profile(slug)
+    except rp.RaceProfileError as exc:
+        st.session_state["rp_flash"] = ("error", str(exc))
+        return
+    st.session_state["rp_loaded"] = profile.settings
+    st.session_state["rp_loaded_name"] = profile.name
+    st.session_state["rp_notes"] = profile.notes
+    st.session_state["rp_course"] = {"name": profile.course_name or profile.slug, "data": gpx} if gpx else None
+    st.session_state["rp_token"] = st.session_state.get("rp_token", 0) + 1
+    st.session_state.pop("opt", None)
+    st.session_state["rp_flash"] = ("success", f"Loaded “{profile.name}”.")
+
+
+def _delete_race(slug: str) -> None:
+    rp.delete_profile(slug)
+    if rp.slugify(st.session_state.get("rp_loaded_name", "")) == slug:
+        for k in ("rp_loaded", "rp_loaded_name", "rp_notes", "rp_course"):
+            st.session_state.pop(k, None)
+        st.session_state["rp_token"] = st.session_state.get("rp_token", 0) + 1
+    st.session_state["rp_flash"] = ("success", "Race plan deleted.")
+
+
+flash = st.session_state.pop("rp_flash", None)
+if flash:
+    (st.success if flash[0] == "success" else st.error)(flash[1])
+save_box = st.container()  # filled at the bottom, once every input value is known (the border is added there)
 
 
 # ----------------------------------------------------------------- cached work
@@ -76,21 +117,52 @@ def cached_opt(_course, _rider, _env, key, np_target, block_m, bound_pct, smooth
 # --------------------------------------------------------------------- sidebar
 profile = RiderProfile.load()
 with st.sidebar:
+    st.header("Saved races")
+    saved = rp.list_profiles()
+    if saved:
+        by_slug = {p.slug: p for p in saved}
+        pick_slug = st.selectbox(
+            "Race plan", list(by_slug), key=f"rp_pick_{T}", format_func=lambda sl: by_slug[sl].name,
+            index=list(by_slug).index(rp.slugify(st.session_state.get("rp_loaded_name", "")))
+            if rp.slugify(st.session_state.get("rp_loaded_name", "")) in by_slug else 0)
+        chosen = by_slug[pick_slug]
+        meta = f"{chosen.course_name or 'no course'} · saved {chosen.saved_at[:10]}"
+        if chosen.last_prediction.get("time"):
+            meta += f" · predicted {chosen.last_prediction['time']}"
+        st.caption(meta + (f"\n\n{chosen.notes}" if chosen.notes else ""))
+        lc, dc = st.columns(2)
+        lc.button("Load", on_click=_load_race, args=(pick_slug,), use_container_width=True)
+        confirm = dc.checkbox("Confirm delete", key=f"rp_confirm_{pick_slug}")
+        st.button("Delete", on_click=_delete_race, args=(pick_slug,), disabled=not confirm,
+                  use_container_width=True)
+    else:
+        st.caption("No saved races yet. Build a plan, then save it from the box at the top of the page.")
+
     st.header("Rider")
     rider = replace(
         profile,
-        mass_kg=st.number_input("System mass (kg)", 40.0, 200.0, float(profile.mass_kg), 0.5),
-        cda=st.number_input("CdA (m²)", 0.10, 0.60, float(profile.cda), 0.001, format="%.3f"),
-        crr=st.number_input("Crr", 0.001, 0.015, float(profile.crr), 0.0001, format="%.4f"),
-        drivetrain_eff=st.number_input("Drivetrain efficiency", 0.90, 1.0, float(profile.drivetrain_eff), 0.005),
-        wind_scale=st.number_input("Wind scale (10 m → rider)", 0.2, 1.2, float(profile.wind_scale), 0.05),
-        tyre_circumference_m=st.number_input("Wheel circumference (m)", 1.9, 2.3, float(profile.tyre_circumference_m),
-                                             0.005, format="%.3f"),
-        cadence_flat=st.number_input("Cadence at 200 W (rpm)", 50.0, 120.0, float(profile.cadence_flat), 1.0),
+        mass_kg=st.number_input("System mass (kg)", 40.0, 200.0, float(D("mass_kg", profile.mass_kg)), 0.5,
+                                key=f"mass_{T}"),
+        cda=st.number_input("CdA (m²)", 0.10, 0.60, float(D("cda", profile.cda)), 0.001, format="%.3f",
+                            key=f"cda_{T}"),
+        crr=st.number_input("Crr", 0.001, 0.015, float(D("crr", profile.crr)), 0.0001, format="%.4f",
+                            key=f"crr_{T}"),
+        drivetrain_eff=st.number_input("Drivetrain efficiency", 0.90, 1.0,
+                                       float(D("drivetrain_eff", profile.drivetrain_eff)), 0.005, key=f"eff_{T}"),
+        wind_scale=st.number_input("Wind scale (10 m → rider)", 0.2, 1.2,
+                                   float(D("wind_scale", profile.wind_scale)), 0.05, key=f"wind_{T}"),
+        tyre_circumference_m=st.number_input("Wheel circumference (m)", 1.9, 2.3,
+                                             float(D("tyre_circumference_m", profile.tyre_circumference_m)),
+                                             0.005, format="%.3f", key=f"circ_{T}"),
+        cadence_flat=st.number_input("Cadence at 200 W (rpm)", 50.0, 120.0,
+                                     float(D("cadence_flat", profile.cadence_flat)), 1.0, key=f"cad_{T}"),
         cadence_per_100w=st.number_input("Cadence change per +100 W (rpm)", -20.0, 40.0,
-                                         float(profile.cadence_per_100w), 0.5),
+                                         float(D("cadence_per_100w", profile.cadence_per_100w)), 0.5,
+                                         key=f"cadslope_{T}"),
     )
-    preset = st.selectbox("Cassette", ["(profile)"] + list(CASSETTES))
+    rider.cassette = list(D("cassette", profile.cassette))
+    rider.chainring = int(D("chainring", profile.chainring))
+    preset = st.selectbox("Cassette", ["(profile)"] + list(CASSETTES), key=f"cass_{T}")
     if preset != "(profile)":
         rider.cassette = list(CASSETTES[preset])
     st.caption("Sprockets: " + ", ".join(map(str, rider.cassette)))
@@ -101,25 +173,35 @@ with st.sidebar:
     st.header("Course model")
     with st.expander("Smoothing & limits"):
         cs = CourseSettings(
-            elev_smooth_m=st.number_input("Elevation smoothing (m)", 0.0, 500.0, 60.0, 10.0),
-            max_grade=st.number_input("Max grade clamp (%)", 5.0, 40.0, 20.0, 1.0) / 100.0,
-            max_lat_accel=st.number_input("Max lateral accel (m/s²)", 1.0, 8.0, 3.5, 0.1),
-            max_descent_speed=st.number_input("Max descent speed (km/h)", 40.0, 110.0, 79.0, 1.0) / 3.6,
+            elev_smooth_m=st.number_input("Elevation smoothing (m)", 0.0, 500.0, float(D("elev_smooth_m", 60.0)), 10.0,
+                                          key=f"elev_{T}"),
+            max_grade=st.number_input("Max grade clamp (%)", 5.0, 40.0, float(D("max_grade_pct", 20.0)), 1.0,
+                                      key=f"grade_{T}") / 100.0,
+            max_lat_accel=st.number_input("Max lateral accel (m/s²)", 1.0, 8.0, float(D("max_lat_accel", 3.5)), 0.1,
+                                          key=f"lat_{T}"),
+            max_descent_speed=st.number_input("Max descent speed (km/h)", 40.0, 110.0,
+                                              float(D("max_descent_kmh", 79.0)), 1.0, key=f"desc_{T}") / 3.6,
         )
-    fill_elev = st.checkbox("Look up elevation online if GPX has none", value=True)
+    fill_elev = st.checkbox("Look up elevation online if GPX has none", value=bool(D("fill_elev", True)),
+                            key=f"fill_{T}")
 
 # ---------------------------------------------------------------------- course
 st.subheader("1. Course")
 gpx_files = sorted(COURSES_DIR.glob("*.gpx")) if COURSES_DIR.exists() else []
 c1, c2 = st.columns(2)
-upload = c1.file_uploader("Upload a GPX file", type=["gpx"])
-pick = c2.selectbox("...or pick from courses/", ["(none)"] + [p.name for p in gpx_files])
+upload = c1.file_uploader("Upload a GPX file", type=["gpx"], key=f"upload_{T}")
+pick = c2.selectbox("...or pick from courses/", ["(none)"] + [p.name for p in gpx_files], key=f"pick_{T}")
+saved_course = st.session_state.get("rp_course")
 
 data, cname = None, None
 if upload is not None:
     data, cname = upload.getvalue(), Path(upload.name).stem
 elif pick != "(none)":
     data, cname = (COURSES_DIR / pick).read_bytes(), Path(pick).stem
+elif saved_course:
+    data, cname = saved_course["data"], saved_course["name"]
+    st.caption(f"Using the course saved with “{st.session_state.get('rp_loaded_name', 'this race')}”. "
+               "Upload or pick another file to replace it.")
 if data is None:
     st.info("Upload a GPX file (or drop one into the `courses/` folder) to get started.")
     st.stop()
@@ -141,9 +223,10 @@ ckey = (course.name, course.n_seg, round(course.length_m), tuple(sorted(cs.__dic
 rkey_even = (rider.mass_kg, rider.cda, rider.crr, rider.drivetrain_eff)
 st.subheader("2. Power and weather")
 i1, i2 = st.columns([1, 2])
-np_race = i1.number_input("Target normalised power (W)", 50.0, 600.0, 250.0, 1.0)
+np_race = i1.number_input("Target normalised power (W)", 50.0, 600.0, float(D("np_race", 250.0)), 1.0,
+                          key=f"np_{T}")
 race_vi = i1.number_input(
-    "Expected race variability index (VI)", 1.00, 1.15, 1.02, 0.01,
+    "Expected race variability index (VI)", 1.00, 1.15, float(D("race_vi", 1.02)), 0.01, key=f"vi_{T}",
     help="Real races are not dead-even: you coast, brake and surge, so average power is NP / VI. VI depends on the "
          "course: roughly 1.02 for a flat, surgy course (Almere, 178 km, was 1.024), about 1.00 for a rolling TT "
          "ridden to power, higher on hilly or technical routes. Set 1.00 for a perfectly constant-power ride. "
@@ -151,15 +234,23 @@ race_vi = i1.number_input(
 # The simulator rides at constant power, so hold the average power a variable ride with this NP would have
 np_target = np_race / race_vi
 i1.caption(f"Your NP {np_race:.0f} W / VI {race_vi:.2f} = **{np_target:.0f} W** simulated constant power.")
-mode = i2.radio("Weather", ["Open-Meteo (forecast / archive)", "Manual wind", "None (still air)"], horizontal=True)
+WX_MODES = ["Open-Meteo (forecast / archive)", "Manual wind", "None (still air)"]
+mode = i2.radio("Weather", WX_MODES, horizontal=True, key=f"wxmode_{T}",
+                index=WX_MODES.index(D("weather_mode", WX_MODES[0])) if D("weather_mode", WX_MODES[0]) in WX_MODES else 0)
+# values of the inactive weather modes are still saved, so start from the saved/default ones
+race_date = date.fromisoformat(D("race_date", (date.today() + timedelta(days=2)).isoformat()))
+start_t = time.fromisoformat(D("start_time", "08:00"))
+tzname = D("timezone", "Europe/London")
+ws, wd, temp, pres = (float(D("wind_kmh", 10.0)), float(D("wind_from_deg", 180.0)), float(D("temp_c", 15.0)),
+                      float(D("pressure_hpa", 1013.0)))
 
 env = Environment()
 env_key = ("none",)
 if mode.startswith("Open-Meteo"):
     w1, w2, w3 = st.columns(3)
-    race_date = w1.date_input("Race date", date.today() + timedelta(days=2))
-    start_t = w2.time_input("Start time (local)", time(8, 0))
-    tzname = w3.text_input("Timezone", "Europe/London")
+    race_date = w1.date_input("Race date", race_date, key=f"date_{T}")
+    start_t = w2.time_input("Start time (local)", start_t, key=f"time_{T}")
+    tzname = w3.text_input("Timezone", tzname, key=f"tz_{T}")
     try:
         tz = ZoneInfo(tzname)
         start_utc = datetime.combine(race_date, start_t, tzinfo=tz).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
@@ -182,10 +273,10 @@ if mode.startswith("Open-Meteo"):
         st.warning(f"Weather unavailable ({exc}); using still air.")
 elif mode.startswith("Manual"):
     w1, w2, w3, w4 = st.columns(4)
-    ws = w1.number_input("Wind speed at rider (km/h)", 0.0, 80.0, 10.0, 1.0)
-    wd = w2.number_input("Wind from (deg, 0 = N, 90 = E)", 0.0, 360.0, 180.0, 5.0)
-    temp = w3.number_input("Temperature (°C)", -10.0, 45.0, 15.0, 1.0)
-    pres = w4.number_input("Pressure (hPa)", 900.0, 1050.0, 1013.0, 1.0)
+    ws = w1.number_input("Wind speed at rider (km/h)", 0.0, 80.0, ws, 1.0, key=f"ws_{T}")
+    wd = w2.number_input("Wind from (deg, 0 = N, 90 = E)", 0.0, 360.0, wd, 5.0, key=f"wd_{T}")
+    temp = w3.number_input("Temperature (°C)", -10.0, 45.0, temp, 1.0, key=f"temp_{T}")
+    pres = w4.number_input("Pressure (hPa)", 900.0, 1050.0, pres, 1.0, key=f"pres_{T}")
     env = Environment(constant_weather(temp, ws / 3.6, wd, pres), None, 1.0)
     env_key = ("manual", ws, wd, temp, pres)
 
@@ -251,7 +342,7 @@ st.markdown("**1x vs 2x for this course**")
 st.caption("Compare the setups you actually race. The 2x score includes an assumed front-derailleur aero penalty "
            "(see `DEFAULT_SETUP_WEIGHTS` in gearing.py); set `aero_delta_cda` to 0 to ignore it.")
 from cycling_tools.gearing import parse_setup
-setup_text = st.text_input("Setups to compare (comma separated)", "58, 60, 56/42")
+setup_text = st.text_input("Setups to compare (comma separated)", D("setups", "58, 60, 56/42"), key=f"setups_{T}")
 try:
     setups = [parse_setup(t.strip()) for t in setup_text.split(",") if t.strip()]
 except ValueError as exc:
@@ -270,20 +361,23 @@ st.info("Be realistic: a well-chosen plan typically saves about 0.5-1% of race t
         "if you can actually hold the power targets. Gains much larger than that usually come from surges that no "
         "rider can repeat, so judge the result by the peak powers and the equal-effort figure below.")
 o1, o2, o3 = st.columns(3)
-block_m = o1.select_slider("Block length", [500, 1000, 1500, 2000], 1000,
+block_m = o1.select_slider("Block length", [500, 1000, 1500, 2000], int(D("block_m", 1000)), key=f"block_{T}",
                            format_func=lambda m: f"{m} m" + (" (aggressive)" if m < 1000 else ""),
                            help="Shorter blocks chase every roll in the road and ask for more surging; 500 m is "
                                 "labelled aggressive. 1 km is the recommended default.")
-bound = o2.slider("Power bounds (± % of NP)", 5, 50, 15)
-smooth = o3.slider("Smoothness penalty", 0.0, 5.0, 0.0, 0.5,
+bound = o2.slider("Power bounds (± % of NP)", 5, 50, int(D("bound_pct", 15)), key=f"bound_{T}")
+smooth = o3.slider("Smoothness penalty", 0.0, 5.0, float(D("smooth", 0.0)), 0.5, key=f"smooth_{T}",
                    help="Penalises changes between adjacent blocks; normalised per km so it means the same at every "
                         "block length.")
-use_caps = st.checkbox("Cap rolling power (keeps the plan rideable)", value=True,
+use_caps = st.checkbox("Cap rolling power (keeps the plan rideable)", value=bool(D("use_caps", True)),
+                       key=f"caps_{T}",
                        help="The NP constraint alone only limits variability over ~30 s. These caps (% of the "
                             "simulated NP) stop the optimiser asking for long hard surges.")
 cc1, cc2 = st.columns(2)
-cap1 = cc1.number_input("1-minute power cap (% of NP)", 100.0, 150.0, 110.0, 1.0, disabled=not use_caps)
-cap5 = cc2.number_input("5-minute power cap (% of NP)", 100.0, 140.0, 106.0, 1.0, disabled=not use_caps)
+cap1 = cc1.number_input("1-minute power cap (% of NP)", 100.0, 150.0, float(D("cap1", 110.0)), 1.0,
+                        disabled=not use_caps, key=f"cap1_{T}")
+cap5 = cc2.number_input("5-minute power cap (% of NP)", 100.0, 140.0, float(D("cap5", 106.0)), 1.0,
+                        disabled=not use_caps, key=f"cap5_{T}")
 caps = ((60, float(cap1)), (300, float(cap5))) if use_caps else ()
 if st.button("Optimise pacing", type="primary"):
     st.session_state["opt"] = (key, np_target,
@@ -322,3 +416,44 @@ else:
 
 st.caption("Model: forward energy balance per 10 m segment; corner/descent speed caps; weather wind scaled to rider "
            "height. See README for limitations.")
+
+
+# ------------------------------------------------------------------ save race
+with save_box, st.container(border=True):
+    st.markdown("#### Save this race plan")
+    st.caption("Stores the course, rider values, power target, weather and optimiser settings under a name you choose, "
+               "so you can come back to it later.")
+    n1, n2 = st.columns([2, 3])
+    race_name = n1.text_input("Race name", value=st.session_state.get("rp_loaded_name", ""), key=f"rp_name_{T}",
+                              placeholder="e.g. Challenge Almere 2027", max_chars=rp.MAX_NAME_LEN)
+    race_notes = n2.text_input("Notes (optional)", value=st.session_state.get("rp_notes", ""), key=f"rp_notes_{T}",
+                               placeholder="e.g. flat, expect a headwind on the way back")
+    slug = rp.slugify(race_name)
+    will_update = bool(slug) and rp.exists(slug)
+    if st.button(f"Update “{race_name.strip()}”" if will_update else "Save race plan", type="primary",
+                 disabled=not slug, key=f"rp_save_{T}"):
+        settings = {
+            "mass_kg": rider.mass_kg, "cda": rider.cda, "crr": rider.crr, "drivetrain_eff": rider.drivetrain_eff,
+            "wind_scale": rider.wind_scale, "tyre_circumference_m": rider.tyre_circumference_m,
+            "cadence_flat": rider.cadence_flat, "cadence_per_100w": rider.cadence_per_100w,
+            "cassette": list(rider.cassette), "chainring": int(rider.chainring),
+            "elev_smooth_m": cs.elev_smooth_m, "max_grade_pct": cs.max_grade * 100.0,
+            "max_lat_accel": cs.max_lat_accel, "max_descent_kmh": cs.max_descent_speed * 3.6, "fill_elev": fill_elev,
+            "np_race": np_race, "race_vi": race_vi, "weather_mode": mode,
+            "race_date": race_date.isoformat(), "start_time": start_t.strftime("%H:%M"), "timezone": tzname,
+            "wind_kmh": ws, "wind_from_deg": wd, "temp_c": temp, "pressure_hpa": pres,
+            "setups": setup_text, "block_m": int(block_m), "bound_pct": int(bound), "smooth": float(smooth),
+            "use_caps": bool(use_caps), "cap1": float(cap1), "cap5": float(cap5),
+        }
+        try:
+            saved_profile = rp.save_profile(
+                race_name, settings, gpx_bytes=data, course_name=course.name, notes=race_notes,
+                last_prediction={"time": fmt_time(even.total_time_s), "time_s": round(even.total_time_s),
+                                 "avg_speed_kmh": round(even.avg_speed_kmh, 2), "np": np_race, "vi": race_vi})
+        except rp.RaceProfileError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["rp_loaded_name"] = saved_profile.name
+            st.session_state["rp_notes"] = saved_profile.notes
+            st.session_state["rp_flash"] = ("success", f"{'Updated' if will_update else 'Saved'} “{saved_profile.name}”.")
+            st.rerun()

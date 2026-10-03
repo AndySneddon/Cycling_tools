@@ -17,3 +17,6 @@ rider_profile.json
 # personal ride files with home-area GPS traces: keep local, do not publish
 Fit_files/Outlaw_Nottingham.fit
 Fit_files/Morning_Gravel_Ride.fit
+
+# saved race plans (course locations): keep local
+race_profiles/
